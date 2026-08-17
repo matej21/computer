@@ -5,8 +5,9 @@ import type * as publicApi from "../index.js";
 import { initializeSchema, ROOT_INODE } from "../schema/index.js";
 import { Database, type Database as DatabaseType, isDatabaseOperationView } from "../storage.js";
 import { coalesceChanges } from "../sync/coalesce.js";
-import { hasObjects } from "../sync/fetch.js";
+import { fetchObjects, hasObjects } from "../sync/fetch.js";
 import { buildManifest } from "../sync/manifests.js";
+import { pushObjects } from "../sync/push.js";
 import { currentRev, writeWatermark } from "../sync/watermarks.js";
 import { SQLiteTestStorage } from "../testing.js";
 import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "../types.js";
@@ -35,6 +36,15 @@ const batchIsInternal: AssertFalse<
 const flushIsInternal: AssertFalse<
   "flushWriteBatchSync" extends keyof typeof publicApi ? true : false
 > = false;
+
+type BatchAccepts<Result> = typeof withWriteBatchSync extends (
+  db: DatabaseType,
+  run: (batchDb: DatabaseType) => Result,
+) => unknown
+  ? true
+  : false;
+
+const inferredPromiseIsRejected: AssertFalse<BatchAccepts<Promise<number>>> = false;
 
 interface ExecutedStatement {
   bindings: unknown[];
@@ -166,6 +176,8 @@ class ProbeThenable implements PromiseLike<string> {
   }
 }
 
+const inferredPromiseLikeIsRejected: AssertFalse<BatchAccepts<ProbeThenable>> = false;
+
 describe("synchronous write batches", () => {
   it("keeps the seam internal and preserves synchronous callback types", async () => {
     expect(batchIsInternal).toBe(false);
@@ -185,6 +197,8 @@ describe("synchronous write batches", () => {
 
       expectTypeOf(result).toEqualTypeOf<number>();
       expect(result).toBe(42);
+      expect(inferredPromiseIsRejected).toBe(false);
+      expect(inferredPromiseLikeIsRejected).toBe(false);
     });
   });
 
@@ -261,7 +275,7 @@ describe("synchronous write batches", () => {
       let escaped: DatabaseType | undefined;
 
       expect(() =>
-        withWriteBatchSync(db, (batchDb: DatabaseType): PromiseLike<string> => {
+        withWriteBatchSync(db, (batchDb: DatabaseType): unknown => {
           escaped = batchDb;
           writeText(batchDb, "/ready/async.txt", "not committed");
           return thenable;
@@ -423,6 +437,32 @@ describe("synchronous write batches", () => {
         mutate(batchDb);
         expect(childCount(batchDb, parentInode)).toBe(1);
       });
+    });
+  });
+
+  it.each([
+    { name: "pushObjects", open: pushObjects },
+    { name: "fetchObjects", open: fetchObjects },
+  ])("flushes staged creates when $name returns its lazy iterator", async ({ open }) => {
+    await withInspectingDatabase(async (db) => {
+      const parentInode = prepareDirectory(db);
+      const bytes = encoder.encode("object payload");
+      const hash = chunksOf(bytes)[0]?.hash;
+      if (hash === undefined) throw new Error("fixture chunk is missing");
+      let objects: AsyncIterable<{ hash: Uint8Array; bytes: Uint8Array }> | undefined;
+
+      withWriteBatchSync(db, (batchDb: DatabaseType) => {
+        writeFileSync(batchDb, "/ready/object.txt", bytes, {}, NOW);
+        expect(childCount(batchDb, parentInode)).toBe(0);
+        objects = open(db, [hash]);
+        expect.soft(childCount(batchDb, parentInode)).toBe(1);
+      });
+
+      const iterable = objects;
+      if (iterable === undefined) throw new Error("object iterator was not created");
+      const yielded: Array<{ hash: Uint8Array; bytes: Uint8Array }> = [];
+      for await (const object of iterable) yielded.push(object);
+      expect(yielded).toEqual([{ hash, bytes }]);
     });
   });
 
