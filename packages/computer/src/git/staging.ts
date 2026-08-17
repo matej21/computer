@@ -22,8 +22,13 @@ export interface IsomorphicGitAddClient {
     cache?: object;
     force?: boolean;
   }): Promise<void>;
-  /** Used by `all` mode to enumerate changed paths. */
-  statusMatrix(args: { fs: object; dir: string; cache?: object }): Promise<StatusMatrixRow[]>;
+  /** Used to enumerate changed paths, for `all` mode and for pathspecs alike. */
+  statusMatrix(args: {
+    fs: object;
+    dir: string;
+    cache?: object;
+    filepaths?: string[];
+  }): Promise<StatusMatrixRow[]>;
   /** Used by `all` mode to stage deletions. */
   remove(args: { fs: object; dir: string; filepath: string; cache?: object }): Promise<void>;
 }
@@ -78,6 +83,13 @@ export async function addWith(opts: AddWithDeps): Promise<void> {
     return addAll(opts, dir);
   }
   if (opts.paths.length === 0) return;
+  if (opts.force === true) {
+    return addFilepaths(opts, dir, opts.paths);
+  }
+  return addChanged(opts, dir);
+}
+
+async function addFilepaths(opts: AddWithDeps, dir: string, filepath: string[]): Promise<void> {
   try {
     // isomorphic-git 1.27+ accepts an array; older versions only
     // accept a single string. We pass the array and let it fan
@@ -85,17 +97,170 @@ export async function addWith(opts: AddWithDeps): Promise<void> {
     await opts.git.add({
       fs: opts.fs,
       dir,
-      filepath: opts.paths,
+      filepath,
       cache: opts.cache,
       force: opts.force,
     });
   } catch (cause) {
     if (isNotARepositoryCause(cause)) throw new NotARepositoryError(dir, { cause });
     if (looksLikePathspecMiss(cause)) {
-      throw new PathspecNotFoundError(firstPathspec(opts.paths), { cause });
+      throw new PathspecNotFoundError(firstPathspec(filepath), { cause });
     }
     throw new GitError("EADDFAIL", `git add failed: ${errorMessage(cause)}`, { cause });
   }
+}
+
+/** Stage only changed files covered by the explicit pathspecs. */
+async function addChanged(opts: AddWithDeps, dir: string): Promise<void> {
+  const indexMetadata = await readFileMetadata(opts.fs, joinPath(dir, ".git/index"));
+  if (indexMetadata === undefined) return addFilepaths(opts, dir, opts.paths);
+
+  const specs = opts.paths.map(normalizePathspec);
+  const racyPaths = new Map<string, true>();
+  let rows: StatusMatrixRow[];
+  try {
+    rows = await opts.git.statusMatrix({
+      fs: trackRacyPaths(opts.fs, indexMetadata.mtimeMs, racyPaths),
+      dir,
+      cache: opts.cache,
+      filepaths: specs,
+    });
+  } catch (cause) {
+    if (isNotARepositoryCause(cause)) throw new NotARepositoryError(dir, { cause });
+    return addFilepaths(opts, dir, opts.paths);
+  }
+
+  const toAdd = new Set<string>();
+  const matched = new Set<string>();
+  for (const [filepath, , workdir, stage] of rows) {
+    const coveredSpecs = specs.filter((spec) => covers(spec, filepath));
+    if (coveredSpecs.length === 0) continue;
+
+    if (workdir !== 0) {
+      for (const spec of coveredSpecs) matched.add(spec);
+    }
+    if (workdir === 0) continue;
+    if (workdir !== stage) {
+      toAdd.add(filepath);
+      continue;
+    }
+
+    const fullpath = joinPath(dir, filepath);
+    if (racyPaths.has(fullpath)) {
+      toAdd.add(filepath);
+      continue;
+    }
+
+    // Some injected clients ignore the fs argument. Preserve exact-file
+    // behavior without turning a directory pathspec into a second tree walk.
+    if (specs.includes(filepath)) {
+      const fallbackMetadata = await readFileMetadata(opts.fs, fullpath);
+      if (fallbackMetadata === undefined || isRacy(fallbackMetadata, indexMetadata.mtimeMs)) {
+        toAdd.add(filepath);
+      }
+    }
+  }
+
+  if (toAdd.size > 0) await addFilepaths(opts, dir, [...toAdd]);
+
+  const unmatched = opts.paths.filter((_path, index) => !matched.has(specs[index]));
+  if (unmatched.length > 0) await addFilepaths(opts, dir, unmatched);
+}
+
+function normalizePathspec(path: string): string {
+  const trimmed = path.replace(/^\.\//, "").replace(/\/+$/, "");
+  return trimmed === "" ? "." : trimmed;
+}
+
+function covers(spec: string, filepath: string): boolean {
+  return spec === "." || spec === filepath || filepath.startsWith(`${spec}/`);
+}
+
+interface PromiseLstatFs {
+  promises: {
+    lstat(path: string): Promise<unknown>;
+  };
+}
+
+interface PromiseFs {
+  promises: object;
+}
+
+interface FileMetadata {
+  mtimeMs: number;
+}
+
+function hasPromiseLstat(fs: object): fs is PromiseLstatFs {
+  if (!("promises" in fs) || typeof fs.promises !== "object" || fs.promises === null) {
+    return false;
+  }
+  return "lstat" in fs.promises && typeof fs.promises.lstat === "function";
+}
+
+function hasPromiseFs(fs: object): fs is PromiseFs {
+  return "promises" in fs && typeof fs.promises === "object" && fs.promises !== null;
+}
+
+function trackRacyPaths(fs: object, indexMtimeMs: number, racyPaths: Map<string, true>): object {
+  if (!hasPromiseFs(fs)) return fs;
+  const trackedPromises = new Proxy(fs.promises, {
+    get(target, property): unknown {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      if (property !== "lstat") {
+        return (...args: unknown[]) => Reflect.apply(value, target, args);
+      }
+      return async (...args: unknown[]): Promise<unknown> => {
+        const result: unknown = await Reflect.apply(value, target, args);
+        const [path] = args;
+        const fileMetadata = statMetadata(result);
+        if (
+          typeof path === "string" &&
+          fileMetadata !== undefined &&
+          isRacy(fileMetadata, indexMtimeMs)
+        ) {
+          racyPaths.set(path, true);
+        }
+        return result;
+      };
+    },
+  });
+  return new Proxy(fs, {
+    get(target, property): unknown {
+      if (property === "promises") return trackedPromises;
+      return Reflect.get(target, property, target);
+    },
+  });
+}
+
+function statMetadata(stat: unknown): FileMetadata | undefined {
+  if (
+    typeof stat !== "object" ||
+    stat === null ||
+    !("mtimeMs" in stat) ||
+    typeof stat.mtimeMs !== "number"
+  ) {
+    return undefined;
+  }
+  return { mtimeMs: stat.mtimeMs };
+}
+
+function isRacy(metadata: FileMetadata, indexMtimeMs: number): boolean {
+  return Math.floor(metadata.mtimeMs / 1000) >= Math.floor(indexMtimeMs / 1000);
+}
+
+async function readFileMetadata(fs: object, path: string): Promise<FileMetadata | undefined> {
+  if (!hasPromiseLstat(fs)) return undefined;
+  try {
+    const stat = await fs.promises.lstat(path);
+    return statMetadata(stat);
+  } catch {
+    return undefined;
+  }
+}
+
+function joinPath(dir: string, path: string): string {
+  return dir.endsWith("/") ? `${dir}${path}` : `${dir}/${path}`;
 }
 
 /**
