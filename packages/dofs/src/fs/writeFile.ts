@@ -12,6 +12,7 @@ import { assertNotInReadOnlyMount, assertNotReadOnly } from "./mount-guard.js";
 import { findPendingWriteBuffer } from "./pendingWriteBuffer.js";
 import { resolveInode } from "./resolve.js";
 import { invalidateResolveExact } from "./resolveCache.js";
+import { flushWriteBatchBeforeMutation, stageWriteBatchCreateSync } from "./writeBatch.js";
 import {
   allocatePendingInode,
   deleteWriteBuffer,
@@ -435,6 +436,7 @@ export function linkStagedChunksSync(
   options: WriteFileOptions,
   mtime: number,
 ): void {
+  flushWriteBatchBeforeMutation(db);
   assertNotReadOnly(db, canonical);
   assertChunkWindows(chunkRefs, canonical);
   const mode = (options.mode ?? 0o644) & 0o7777;
@@ -723,6 +725,7 @@ export function createFileSync(
   options: WriteFileOptions,
   now: () => number,
 ): void {
+  flushWriteBatchBeforeMutation(db);
   const { path: canonical } = canonicalizePath(path);
   const target = directTargetForPath(db, path);
   const mode = (options.mode ?? 0o644) & 0o7777;
@@ -752,6 +755,7 @@ export function createFileSync(
 // buffer instead of the SQLite chunk/blob store. Release commits
 // the bytes back to chunks.
 export function openWriteBufferSync(db: Database, path: string): void {
+  flushWriteBatchBeforeMutation(db);
   const { path: canonical } = canonicalizePath(path);
   const pending = findPendingWriteBuffer(db, canonical);
   if (pending !== undefined) {
@@ -788,6 +792,7 @@ export function openWriteBufferForCreateSync(
   options: WriteFileOptions,
   now: () => number,
 ): void {
+  flushWriteBatchBeforeMutation(db);
   const { path: canonical } = canonicalizePath(path);
   if (getPendingWriteBufferByPath(db, canonical) !== undefined) {
     throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
@@ -826,6 +831,7 @@ export function openWriteBufferForCreateSync(
 // time so an intermediate chmod survives. Pending-create entries
 // emit their INSERT + dirent + chunks in the same transaction.
 export function releaseWriteBufferSync(db: Database, path: string, now: () => number): void {
+  flushWriteBatchBeforeMutation(db);
   const { path: canonical } = canonicalizePath(path);
   const pending = findPendingWriteBuffer(db, canonical);
   if (pending !== undefined) {
@@ -976,6 +982,7 @@ function commitPendingBuffer(db: Database, entry: WriteBufferEntry, now: () => n
  * committed. External callers should never invoke this directly.
  */
 export function flushPendingByPath(db: Database, path: string, now: () => number): boolean {
+  flushWriteBatchBeforeMutation(db);
   const { path: canonical } = canonicalizePath(path);
   const entry = findPendingWriteBuffer(db, canonical);
   if (entry === undefined || entry.pending === undefined) return false;
@@ -985,6 +992,7 @@ export function flushPendingByPath(db: Database, path: string, now: () => number
 
 /** @internal Commits pending files reached through a node before its dirent changes. */
 export function flushPendingUnderNode(db: Database, path: string, now: () => number): void {
+  flushWriteBatchBeforeMutation(db);
   const node = resolveInode(db, path, { followSymlinks: false });
   if (node === null) return;
 
@@ -1036,6 +1044,7 @@ export function writeRangeSync(
   options: WriteFileOptions,
   now: () => number,
 ): number {
+  flushWriteBatchBeforeMutation(db);
   const { path: canonical } = canonicalizePath(path);
   assertNotReadOnly(db, canonical);
   if (!Number.isInteger(offset) || offset < 0) {
@@ -1122,6 +1131,7 @@ export function truncateFileSync(
   size: number,
   now: () => number,
 ): void {
+  flushWriteBatchBeforeMutation(db);
   const { path: canonical } = canonicalizePath(path);
   assertNotReadOnly(db, canonical);
   if (!Number.isInteger(size) || size < 0) {
@@ -1209,6 +1219,9 @@ export function writeFileSync(
   const mode = (options.mode ?? 0o644) & 0o7777;
   const mtime = now();
 
+  if (stageWriteBatchCreateSync(db, canonical, bytes, options, () => mtime)) return;
+  flushWriteBatchBeforeMutation(db);
+
   db.transactionSync(() => {
     const target = resolveWriteTarget(db, parts, canonical, options);
     if (target.kind === "existing") {
@@ -1250,6 +1263,7 @@ export function writeFileRangesSync(
   options: WriteFileOptions,
   now: () => number,
 ): void {
+  flushWriteBatchBeforeMutation(db);
   const { parts, path: canonical } = canonicalizePath(path);
   if (parts.length === 0) {
     throw createWorkspaceError("EISDIR", "cannot write to the root directory", canonical);

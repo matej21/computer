@@ -1,3 +1,4 @@
+import { flushWriteBatchBeforeRead } from "../fs/writeBatch.js";
 import type { Database } from "../storage.js";
 import type { ChangeEntry } from "./changes.js";
 import { coalesceChanges } from "./coalesce.js";
@@ -21,6 +22,7 @@ export function fetchObjects(
   db: Database,
   hashes: Uint8Array[],
 ): AsyncIterable<{ hash: Uint8Array; bytes: Uint8Array }> {
+  flushWriteBatchBeforeRead(db);
   return pushObjects(db, hashes);
 }
 
@@ -45,6 +47,7 @@ const PROBE_BATCH = 100;
 // rides the primary-key index. Present hashes are returned in input
 // order, preserving any duplicates the caller passed.
 export function hasObjects(db: Database, hashes: Uint8Array[]): Uint8Array[] {
+  flushWriteBatchBeforeRead(db);
   if (hashes.length === 0) return [];
   const present = new Set<string>();
   for (let i = 0; i < hashes.length; i += PROBE_BATCH) {

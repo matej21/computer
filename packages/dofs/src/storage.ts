@@ -124,6 +124,7 @@ class DatabaseCore {
 const cores = new WeakMap<DurableObjectStorageLike, DatabaseCore>();
 const databaseCores = new WeakMap<Database, DatabaseCore>();
 const operations = new WeakMap<Database, OperationState>();
+const transactionBarriers = new WeakMap<DatabaseCore, () => void>();
 
 function coreForStorage(storage: DurableObjectStorageLike): DatabaseCore {
   let core = cores.get(storage);
@@ -183,6 +184,7 @@ export class Database {
     };
     this.transactionSync = <T>(closure: () => T): T => {
       assertOpen(this);
+      transactionBarriers.get(core)?.();
       return transact(core, closure);
     };
   }
@@ -313,6 +315,20 @@ export function closeDatabaseOperationView(db: Database): void {
   if (operation === undefined || operation.closed) return;
   operation.closed = true;
   clearOperationCaches(operation);
+}
+
+export function transactDatabaseWithoutBarrier<T>(db: Database, closure: () => T): T {
+  assertOpen(db);
+  return transact(coreForDatabase(db), closure);
+}
+
+export function registerDatabaseTransactionBarrier(db: Database, barrier: () => void): () => void {
+  assertOpen(db);
+  const core = coreForDatabase(db);
+  transactionBarriers.set(core, barrier);
+  return () => {
+    if (transactionBarriers.get(core) === barrier) transactionBarriers.delete(core);
+  };
 }
 
 export function databaseCoherenceGeneration(db: Database): number {

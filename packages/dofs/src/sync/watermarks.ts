@@ -1,3 +1,4 @@
+import { flushWriteBatchBeforeMutation, flushWriteBatchBeforeRead } from "../fs/writeBatch.js";
 import type { Database } from "../storage.js";
 
 // Watermarks owned by the local database. Keyed by (k, backend) so a
@@ -88,6 +89,7 @@ export function writeWatermark(
   value: number,
   backend: string = DEFAULT_BACKEND_ID,
 ): void {
+  flushWriteBatchBeforeMutation(db);
   writeWatermarkValue(db, key, value, backend);
 }
 
@@ -126,5 +128,6 @@ export function compareChangeCursors(a: ChangeCursor, b: ChangeCursor): number {
 // to callers that want to record the rev component of their next
 // cursor.
 export function currentRev(db: Database): number {
+  flushWriteBatchBeforeRead(db);
   return db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'") ?? 0;
 }

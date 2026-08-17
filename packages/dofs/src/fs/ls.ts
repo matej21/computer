@@ -1,6 +1,7 @@
 import { canonicalizePath } from "../path.js";
 import { ROOT_INODE } from "../schema/index.js";
 import type { Database } from "../storage.js";
+import { flushWriteBatchBeforeRead } from "./writeBatch.js";
 
 interface PathRow {
   path: string;
@@ -48,6 +49,7 @@ function resolvePrefixInode(db: Database, parts: string[]): number | null {
 }
 
 export function ls(db: Database, prefix: string): string[] {
+  flushWriteBatchBeforeRead(db);
   const { parts, path: canonical } = canonicalizePath(prefix);
   const inode = resolvePrefixInode(db, parts);
   if (inode === null) return [];
