@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { clearBlobCache } from "./blobCache.js";
 import { WorkspaceFilesystem } from "./filesystem.js";
 import { link } from "./link.js";
+import { invalidateReadOnlyMountCache } from "./mount-guard.js";
 import { withDB } from "./with-db.js";
 
 const MIB = 1024 * 1024;
@@ -9,6 +10,10 @@ const WALK_MAX_BYTES = MIB;
 const FILE_MAX_BYTES = 4 * MIB;
 const MUTATION_MAX_ENTRIES = 10_000;
 const MUTATION_MAX_METADATA_BYTES = 4 * MIB;
+const READ_FILES_MAX_PATHS = 4096;
+const READ_FILES_MAX_PATH_BYTES = MIB;
+const WALK_MAX_EXCLUDES = 256;
+const WALK_MAX_EXCLUDE_BYTES = 64 * 1024;
 
 async function withFs<T>(run: (fs: WorkspaceFilesystem) => T | Promise<T>): Promise<T> {
   return withDB((db) => run(new WorkspaceFilesystem(db, { now: () => 1000 })));
@@ -16,6 +21,40 @@ async function withFs<T>(run: (fs: WorkspaceFilesystem) => T | Promise<T>): Prom
 
 function decode(bytes: Uint8Array | undefined): string | undefined {
   return bytes === undefined ? undefined : new TextDecoder().decode(bytes);
+}
+
+async function seedEmptyFiles(
+  fs: WorkspaceFilesystem,
+  directory: string,
+  count: number,
+): Promise<void> {
+  await fs.mkdir(directory, { recursive: true });
+  const parent = await fs.stat(directory);
+  const firstInode =
+    (fs.db.scalar<number>("SELECT COALESCE(MAX(inode), 0) FROM vfs_nodes") ?? 0) + 1;
+  fs.db.transactionSync(() => {
+    fs.db.run(
+      `WITH RECURSIVE sequence(value) AS (
+         SELECT 0
+         UNION ALL
+         SELECT value + 1 FROM sequence WHERE value + 1 < ?
+       )
+       INSERT INTO vfs_nodes (type, mode, mtime, rev, size)
+       SELECT 'file', ?, 1000, 0, 0 FROM sequence`,
+      count,
+      0o644,
+    );
+    fs.db.run(
+      `INSERT INTO vfs_dirents (parent_inode, name, child_inode)
+       SELECT ?, printf('f%05d', inode - ?), inode
+         FROM vfs_nodes
+        WHERE inode >= ?
+        ORDER BY inode`,
+      parent.inode,
+      firstInode,
+      firstInode,
+    );
+  });
 }
 
 describe("public bounded bulk filesystem", () => {
@@ -65,29 +104,51 @@ describe("public bounded bulk filesystem", () => {
     });
   });
 
-  it("binds walk cursors to the root and traversal options", async () => {
+  it("uses state-free snapshot cursors bound to the root and every traversal option", async () => {
     await withFs(async (fs) => {
       await fs.mkdir("/tree", { recursive: true });
       await fs.mkdir("/other", { recursive: true });
       await fs.writeFile("/tree/a", "a");
       await fs.writeFile("/tree/b", "b");
-      const first = await fs.walk("/tree", { limit: 1, maxBytes: WALK_MAX_BYTES });
+      const options = {
+        limit: 1,
+        maxBytes: WALK_MAX_BYTES,
+        depth: 2,
+        exclude: ["skip"],
+        excludeHidden: true,
+      };
+      const first = await fs.walk("/tree", options);
       expect(first.cursor).toEqual(expect.any(String));
 
+      const independent = new WorkspaceFilesystem(fs.db, { now: () => 1000 });
       await expect(
-        fs.walk("/other", { limit: 1, maxBytes: WALK_MAX_BYTES, cursor: first.cursor }),
-      ).rejects.toMatchObject({ code: "EINVAL" });
+        independent.walk("/tree", { ...options, cursor: first.cursor }),
+      ).resolves.toMatchObject({ entries: [{ path: "/tree/b" }] });
+
+      await expect(fs.walk("/other", { ...options, cursor: first.cursor })).rejects.toMatchObject({
+        code: "EINVAL",
+      });
       await expect(
         fs.walk("/tree", {
-          limit: 1,
-          maxBytes: WALK_MAX_BYTES,
+          ...options,
           cursor: first.cursor,
           depth: 1,
         }),
       ).rejects.toMatchObject({ code: "EINVAL" });
       await expect(
-        fs.walk("/tree", { limit: 1, maxBytes: WALK_MAX_BYTES, cursor: "not-a-cursor" }),
+        fs.walk("/tree", { ...options, cursor: first.cursor, exclude: ["other"] }),
       ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(
+        fs.walk("/tree", { ...options, cursor: first.cursor, excludeHidden: false }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(fs.walk("/tree", { ...options, cursor: "not-a-cursor" })).rejects.toMatchObject({
+        code: "EINVAL",
+      });
+
+      await fs.writeFile("/tree/c", "c");
+      await expect(fs.walk("/tree", { ...options, cursor: first.cursor })).rejects.toMatchObject({
+        code: "ESTALE",
+      });
     });
   });
 
@@ -113,6 +174,28 @@ describe("public bounded bulk filesystem", () => {
       await expect(
         fs.walk("/tree", { limit: 1, maxBytes: WALK_MAX_BYTES, depth: -1 }),
       ).rejects.toMatchObject({ code: "EINVAL" });
+
+      await expect(
+        fs.walk("/tree", {
+          limit: 1,
+          maxBytes: WALK_MAX_BYTES,
+          exclude: Array.from({ length: WALK_MAX_EXCLUDES + 1 }, () => "x"),
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(
+        fs.walk("/tree", {
+          limit: 1,
+          maxBytes: WALK_MAX_BYTES,
+          exclude: ["x".repeat(WALK_MAX_EXCLUDE_BYTES + 1)],
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(
+        fs.walk("/tree", {
+          limit: 1,
+          maxBytes: WALK_MAX_BYTES,
+          exclude: ["x".repeat(WALK_MAX_EXCLUDE_BYTES)],
+        }),
+      ).resolves.toEqual(expect.objectContaining({ entries: expect.any(Array) }));
     });
   });
 
@@ -156,8 +239,9 @@ describe("public bounded bulk filesystem", () => {
     await withFs(async (fs) => {
       await fs.writeFile("/a", "aaaa");
       await fs.writeFile("/b", "bbbb");
-      await fs.writeFile("/large", "large");
-      const paths = ["/a", "/b", "/large"];
+      await fs.writeFile("/exact", "exact");
+      await fs.writeFile("/large", "large!");
+      const paths = ["/a", "/b", "/exact", "/large"];
 
       const first = await fs.readFiles(paths, { limit: 3, maxBytes: 5 });
       expect(first.entries.map((entry) => entry.path)).toEqual(["/a"]);
@@ -173,11 +257,18 @@ describe("public bounded bulk filesystem", () => {
         maxBytes: 5,
         cursor: second.cursor,
       });
-      expect(third.entries[0]?.error).toMatchObject({ code: "EFBIG", path: "/large" });
-      expect(third.cursor).toBeUndefined();
+      expect(decode(third.entries[0]?.content)).toBe("exact");
+      expect(third.cursor).toEqual(expect.any(String));
+      const fourth = await fs.readFiles(paths, {
+        limit: 3,
+        maxBytes: 5,
+        cursor: third.cursor,
+      });
+      expect(fourth.entries[0]?.error).toMatchObject({ code: "EFBIG", path: "/large" });
+      expect(fourth.cursor).toBeUndefined();
 
       await expect(
-        fs.readFiles(["/a", "/large"], {
+        fs.readFiles(["/a", "/exact"], {
           limit: 3,
           maxBytes: 5,
           cursor: first.cursor,
@@ -189,6 +280,59 @@ describe("public bounded bulk filesystem", () => {
       await expect(
         fs.readFiles(paths, { limit: 1, maxBytes: FILE_MAX_BYTES + 1 }),
       ).rejects.toMatchObject({ code: "EINVAL" });
+    });
+  });
+
+  it("bounds readFiles request metadata and invalidates cursors after any new revision", async () => {
+    await withFs(async (fs) => {
+      await fs.writeFile("/a", "aaaa");
+      await fs.writeFile("/b", "bbbb");
+      const paths = ["/a", "/b"];
+      const first = await fs.readFiles(paths, { limit: 1, maxBytes: FILE_MAX_BYTES });
+      expect(first.cursor).toEqual(expect.any(String));
+
+      const independent = new WorkspaceFilesystem(fs.db, { now: () => 1000 });
+      await expect(
+        independent.readFiles(paths, {
+          limit: 1,
+          maxBytes: FILE_MAX_BYTES,
+          cursor: first.cursor,
+        }),
+      ).resolves.toMatchObject({ entries: [{ path: "/b" }] });
+      await expect(
+        fs.readFiles(paths, {
+          limit: 1,
+          maxBytes: FILE_MAX_BYTES,
+          cursor: "not-a-cursor",
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+
+      const exactMetadataPath = `/${"x".repeat(READ_FILES_MAX_PATH_BYTES - 1)}`;
+      const exact = await fs.readFiles([exactMetadataPath], {
+        limit: 1,
+        maxBytes: FILE_MAX_BYTES,
+      });
+      expect(exact.entries[0]?.error).toMatchObject({ code: "ENOENT", path: exactMetadataPath });
+      await expect(
+        fs.readFiles([`/${"x".repeat(READ_FILES_MAX_PATH_BYTES)}`], {
+          limit: 1,
+          maxBytes: FILE_MAX_BYTES,
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(
+        fs.readFiles(
+          Array.from({ length: READ_FILES_MAX_PATHS + 1 }, () => "/a"),
+          {
+            limit: 1,
+            maxBytes: FILE_MAX_BYTES,
+          },
+        ),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+
+      await fs.writeFile("/unrelated", "change");
+      await expect(
+        fs.readFiles(paths, { limit: 1, maxBytes: FILE_MAX_BYTES, cursor: first.cursor }),
+      ).rejects.toMatchObject({ code: "ESTALE" });
     });
   });
 
@@ -256,6 +400,18 @@ describe("public bounded bulk filesystem", () => {
       await expect(fs.readFile("/symlink-target", "utf8")).resolves.toBe("through link");
       await expect(fs.readFile("/hard-target", "utf8")).resolves.toBe("through hardlink");
       expect((await fs.lstat("/symlink-name")).isSymbolicLink).toBe(true);
+
+      await fs.writeFiles(
+        [
+          { path: "/hard-name", content: "first alias" },
+          { path: "/hard-target", content: "last alias" },
+          { path: "/symlink-name", content: "first symlink alias" },
+          { path: "/symlink-target", content: "last symlink alias" },
+        ],
+        { maxBytes: FILE_MAX_BYTES },
+      );
+      await expect(fs.readFile("/hard-name", "utf8")).resolves.toBe("last alias");
+      await expect(fs.readFile("/symlink-name", "utf8")).resolves.toBe("last symlink alias");
     });
   });
 
@@ -272,9 +428,27 @@ describe("public bounded bulk filesystem", () => {
       expect(await fs.readdir("/out")).toEqual([]);
 
       await expect(
+        fs.writeFiles(
+          Array.from({ length: 1025 }, () => ({ path: "/out/repeated", content: "x" })),
+          { maxBytes: FILE_MAX_BYTES },
+        ),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(fs.stat("/out/repeated")).rejects.toMatchObject({ code: "ENOENT" });
+
+      await expect(
         fs.writeFiles([{ path: "/out/large", content: "x".repeat(5) }], { maxBytes: 4 }),
       ).rejects.toMatchObject({ code: "EINVAL" });
       await expect(fs.stat("/out/large")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        fs.writeFiles(
+          [
+            { path: "/out/duplicate", content: "abc" },
+            { path: "/out/duplicate", content: "def" },
+          ],
+          { maxBytes: 5 },
+        ),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(fs.stat("/out/duplicate")).rejects.toMatchObject({ code: "ENOENT" });
       await expect(fs.writeFiles([], { maxBytes: FILE_MAX_BYTES + 1 })).rejects.toMatchObject({
         code: "EINVAL",
       });
@@ -347,22 +521,132 @@ describe("public bounded bulk filesystem", () => {
     });
   });
 
+  it("normalizes rmFiles only after raw bounds and preserves single-rm path semantics", async () => {
+    await withFs(async (fs) => {
+      await fs.mkdir("/minimal/sub", { recursive: true });
+      await fs.writeFile("/minimal/sub/file", "file");
+      await expect(
+        fs.rmFiles(["/minimal/sub/file", "/minimal/sub/file"], {
+          recursive: true,
+          maxEntries: 1,
+          maxMetadataBytes: MUTATION_MAX_METADATA_BYTES,
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(fs.readFile("/minimal/sub/file", "utf8")).resolves.toBe("file");
+
+      await fs.writeFile("/raw-byte", "file");
+      await expect(
+        fs.rmFiles(["/raw-byte", "/raw-byte"], {
+          maxEntries: 10,
+          maxMetadataBytes: new TextEncoder().encode("/raw-byte").byteLength,
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(fs.readFile("/raw-byte", "utf8")).resolves.toBe("file");
+
+      await fs.rmFiles(["/minimal/sub/file", "/minimal/sub/file", "/minimal/sub"], {
+        recursive: true,
+        maxEntries: 10,
+        maxMetadataBytes: MUTATION_MAX_METADATA_BYTES,
+      });
+      await expect(fs.stat("/minimal/sub")).rejects.toMatchObject({ code: "ENOENT" });
+
+      await fs.mkdir("/real", { recursive: true });
+      await fs.writeFile("/real/file", "file");
+      await fs.symlink("/real", "/alias");
+      await fs.rmFiles(["/alias/file"], {
+        maxEntries: 10,
+        maxMetadataBytes: MUTATION_MAX_METADATA_BYTES,
+      });
+      await expect(fs.stat("/real/file")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readlink("/alias")).toBe("/real");
+
+      await expect(
+        fs.rmFiles(["/"], {
+          recursive: true,
+          force: true,
+          maxEntries: MUTATION_MAX_ENTRIES,
+          maxMetadataBytes: MUTATION_MAX_METADATA_BYTES,
+        }),
+      ).rejects.toMatchObject({ code: "EPERM", path: "/" });
+
+      await fs.mkdir("/protected", { recursive: true });
+      await fs.writeFile("/protected/file", "protected");
+      fs.db.run(
+        "INSERT INTO _vfs_mounts (root, kind, indexed, mode) VALUES (?, 'test', 1, 'read-only')",
+        "/protected",
+      );
+      invalidateReadOnlyMountCache(fs.db);
+      await expect(
+        fs.rmFiles(["/protected/file"], {
+          maxEntries: 10,
+          maxMetadataBytes: MUTATION_MAX_METADATA_BYTES,
+        }),
+      ).rejects.toMatchObject({ code: "EROFS", path: "/protected/file" });
+      await expect(fs.readFile("/protected/file", "utf8")).resolves.toBe("protected");
+    });
+  });
+
   it("copies trees atomically by metadata while preserving links", async () => {
     await withFs(async (fs) => {
-      await fs.mkdir("/source/sub", { recursive: true });
+      await fs.mkdir("/source", { mode: 0o700 });
+      await fs.mkdir("/source/sub");
       await fs.writeFile("/source/file", "file");
       link(fs.db, "/source/file", "/source/sub/hard");
+      link(fs.db, "/source/file", "/outside-hardlink");
       await fs.symlink("../file", "/source/sub/link");
+      const sourceDirectory = await fs.stat("/source");
+      fs.db.run("UPDATE vfs_nodes SET mtime = ? WHERE inode = ?", 500, sourceDirectory.inode);
 
       await fs.cp("/source", "/copy", { recursive: true });
       await expect(fs.readFile("/copy/file", "utf8")).resolves.toBe("file");
+      expect((await fs.stat("/copy")).mode).toBe(0o700);
+      expect((await fs.stat("/copy")).mtime).toBe(1000);
       expect(await fs.readlink("/copy/sub/link")).toBe("../file");
       expect((await fs.stat("/copy/file")).inode).toBe((await fs.stat("/copy/sub/hard")).inode);
       expect((await fs.stat("/copy/file")).inode).not.toBe((await fs.stat("/source/file")).inode);
+      expect((await fs.stat("/copy/file")).inode).not.toBe(
+        (await fs.stat("/outside-hardlink")).inode,
+      );
 
       await fs.writeFile("/copy/sub/hard", "changed");
       await expect(fs.readFile("/copy/file", "utf8")).resolves.toBe("changed");
       await expect(fs.readFile("/source/file", "utf8")).resolves.toBe("file");
+      await expect(fs.readFile("/outside-hardlink", "utf8")).resolves.toBe("file");
+    });
+  });
+
+  it("copies files and symlinks with explicit metadata and destination semantics", async () => {
+    await withFs(async (fs) => {
+      await fs.writeFile("/file", "file", { mode: 0o600 });
+      const source = await fs.stat("/file");
+      fs.db.run("UPDATE vfs_nodes SET mtime = ? WHERE inode = ?", 500, source.inode);
+      await fs.cp("/file", "/file-copy");
+      await expect(fs.readFile("/file-copy", "utf8")).resolves.toBe("file");
+      expect((await fs.stat("/file-copy")).mode).toBe(0o600);
+      expect((await fs.stat("/file-copy")).mtime).toBe(1000);
+
+      await fs.symlink("/file", "/file-link");
+      await fs.cp("/file-link", "/link-copy");
+      expect(await fs.readlink("/link-copy")).toBe("/file");
+      expect((await fs.lstat("/link-copy")).isSymbolicLink).toBe(true);
+
+      await fs.mkdir("/source-dir", { recursive: true });
+      await fs.writeFile("/source-dir/replaced", "new");
+      await fs.mkdir("/dest-dir", { recursive: true });
+      await fs.writeFile("/dest-dir/replaced", "old");
+      await fs.writeFile("/dest-dir/kept", "kept");
+      await fs.cp("/source-dir", "/dest-dir", { recursive: true });
+      await expect(fs.readFile("/dest-dir/replaced", "utf8")).resolves.toBe("new");
+      await expect(fs.readFile("/dest-dir/kept", "utf8")).resolves.toBe("kept");
+
+      await fs.writeFile("/replace-file", "old");
+      await fs.cp("/file", "/replace-file");
+      await expect(fs.readFile("/replace-file", "utf8")).resolves.toBe("file");
+
+      await expect(fs.cp("/file", "/missing-parent/file")).rejects.toMatchObject({
+        code: "ENOENT",
+        path: "/missing-parent/file",
+      });
     });
   });
 
@@ -392,6 +676,11 @@ describe("public bounded bulk filesystem", () => {
       await expect(fs.cp("/source", "/source/inside", { recursive: true })).rejects.toMatchObject({
         code: "EINVAL",
       });
+      await fs.symlink("/source", "/source-alias");
+      await expect(
+        fs.cp("/source", "/source-alias/inside", { recursive: true }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(fs.stat("/source/inside")).rejects.toMatchObject({ code: "ENOENT" });
       await fs.writeFile("/occupied", "unchanged");
       await expect(fs.cp("/source", "/occupied", { recursive: true })).rejects.toMatchObject({
         code: "EEXIST",
@@ -409,6 +698,12 @@ describe("public bounded bulk filesystem", () => {
           maxMetadataBytes: MUTATION_MAX_METADATA_BYTES + 1,
         }),
       ).rejects.toMatchObject({ code: "EINVAL" });
+
+      await seedEmptyFiles(fs, "/oversized-source", MUTATION_MAX_ENTRIES + 1);
+      await expect(
+        fs.cp("/oversized-source", "/default-bounds", { recursive: true }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(fs.stat("/default-bounds")).rejects.toMatchObject({ code: "ENOENT" });
     });
   });
 });
