@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { find } from "./find.js";
+import { find, type WorkspaceFoundEntry } from "./find.js";
 import { mkdir } from "./mkdir.js";
+import { symlink } from "./symlink.js";
 import { withDB } from "./with-db.js";
 import { writeFile } from "./writeFile.js";
 
@@ -25,6 +26,28 @@ describe("find", () => {
         { path: "/a/x.ts", type: "file" },
       ]);
     });
+  });
+
+  it("returns a symlink without traversing its target", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/target", {}, () => 0);
+      await writeFile(db, "/target/inside.txt", "", {}, () => 0);
+      symlink(db, "/target", "/alias", () => 0);
+
+      const entries = find(db, "/").sort((a, b) => a.path.localeCompare(b.path));
+
+      expect(entries).toEqual([
+        { path: "/alias", type: "symlink" },
+        { path: "/target", type: "dir" },
+        { path: "/target/inside.txt", type: "file" },
+      ]);
+    });
+  });
+
+  it("includes symlinks in the public found-entry type", () => {
+    const entryType: WorkspaceFoundEntry["type"] = "symlink";
+
+    expect(entryType).toBe("symlink");
   });
 
   it("treats an empty pattern like no pattern and returns every entry", async () => {
