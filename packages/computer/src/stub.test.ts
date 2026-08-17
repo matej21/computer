@@ -670,3 +670,52 @@ describe("WorkspaceStub", () => {
     );
   });
 });
+
+describe("WorkspaceFilesystemStub bounded bulk methods", () => {
+  it("returns plain walk and readFiles pages", async () => {
+    await withStub(async (ws) => {
+      const fs = ws.stub().fs;
+      await fs.mkdir("/tree", { recursive: true });
+      await fs.writeFile("/tree/a", "alpha");
+
+      await expect(fs.walk("/tree", { limit: 10, maxBytes: 1024 * 1024 })).resolves.toMatchObject({
+        entries: [{ path: "/tree/a", type: "file" }],
+      });
+      const read = await fs.readFiles(["/tree/a", "/tree/missing"], {
+        limit: 2,
+        maxBytes: 4 * 1024 * 1024,
+      });
+      expect(new TextDecoder().decode(read.entries[0]?.content)).toBe("alpha");
+      expect(read.entries[1]?.error).toMatchObject({ code: "ENOENT", path: "/tree/missing" });
+      expect(read.cursor).toBeUndefined();
+    });
+  });
+
+  it("forwards atomic bounded writeFiles, rmFiles, and cp", async () => {
+    await withStub(async (ws) => {
+      const fs = ws.stub().fs;
+      await fs.mkdir("/tree", { recursive: true });
+      await fs.writeFiles(
+        [
+          { path: "/tree/a", content: "alpha" },
+          { path: "/tree/b", content: new Uint8Array([98]) },
+        ],
+        { maxBytes: 4 * 1024 * 1024 },
+      );
+      await fs.cp("/tree", "/copy", {
+        recursive: true,
+        maxEntries: 10_000,
+        maxMetadataBytes: 4 * 1024 * 1024,
+      });
+      await expect(fs.readFile("/copy/a", "utf8")).resolves.toBe("alpha");
+
+      await fs.rmFiles(["/tree", "/copy"], {
+        recursive: true,
+        maxEntries: 10_000,
+        maxMetadataBytes: 4 * 1024 * 1024,
+      });
+      await expect(fs.stat("/tree")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat("/copy")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+});
