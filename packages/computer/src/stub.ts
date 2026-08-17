@@ -49,6 +49,7 @@ import type {
   ReadFileOptions,
   ReadFilesEntry,
   ReadFilesOptions,
+  RmFilesOptions,
   RmOptions,
   WalkOptions,
   WorkspaceDirentResult,
@@ -58,6 +59,8 @@ import type {
   WorkspaceWalkEntry,
   WriteFileContent,
   WriteFileOptions,
+  WriteFilesEntry,
+  WriteFilesOptions,
 } from "@cloudflare/dofs";
 import { RpcTarget } from "capnweb";
 
@@ -184,12 +187,15 @@ export class WorkspaceFilesystemStub extends RpcTarget {
     );
   }
 
-  walk(directory: string, options: WalkOptions): Promise<BulkPage<WorkspaceWalkEntry>> {
+  async walk(directory: string, options: WalkOptions): Promise<BulkPage<WorkspaceWalkEntry>> {
     return withSpan(
       this.#ws.observer,
       "workspace.fs.walk",
       { "workspace.fs.path": directory },
-      () => this.#ws.fs.walk(directory, options),
+      async () => {
+        const page = await this.#ws.fs.walk(directory, options);
+        return Array.isArray(page) ? { entries: page } : page;
+      },
     );
   }
 
@@ -272,6 +278,15 @@ export class WorkspaceFilesystemStub extends RpcTarget {
     );
   }
 
+  writeFiles(entries: readonly WriteFilesEntry[], options: WriteFilesOptions): Promise<void> {
+    return withSpan(
+      this.#ws.observer,
+      "workspace.fs.writeFiles",
+      { "workspace.fs.entries": entries.length },
+      () => this.#ws.fs.writeFiles(entries, options),
+    );
+  }
+
   mkdir(path: string, options: MkdirOptions = {}): Promise<void> {
     return withSpan(
       this.#ws.observer,
@@ -291,6 +306,15 @@ export class WorkspaceFilesystemStub extends RpcTarget {
         "workspace.fs.force": options.force,
       },
       () => this.#ws.fs.rm(path, options),
+    );
+  }
+
+  rmFiles(paths: readonly string[], options: RmFilesOptions): Promise<void> {
+    return withSpan(
+      this.#ws.observer,
+      "workspace.fs.rmFiles",
+      { "workspace.fs.paths": paths.length },
+      () => this.#ws.fs.rmFiles(paths, options),
     );
   }
 

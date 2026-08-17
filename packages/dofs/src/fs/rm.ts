@@ -33,6 +33,35 @@ const SUBTREE_CTE = `WITH RECURSIVE subtree(inode, type, path) AS (
 
 const DELETE_PAGE = 10_000;
 
+export interface RemovalRoot {
+  inode: number;
+  type: "file" | "dir" | "symlink";
+  path: string;
+  parentInode: number;
+  name: string;
+}
+
+const ROOT_SET_CTE = `WITH RECURSIVE
+  roots(inode, type, path, parent_inode, name) AS (
+    SELECT json_extract(value, '$[0]'),
+           json_extract(value, '$[1]'),
+           json_extract(value, '$[2]'),
+           json_extract(value, '$[3]'),
+           json_extract(value, '$[4]')
+      FROM json_each(?)
+  ),
+  subtree(inode, type, path, parent_inode, name) AS (
+    SELECT inode, type, path, parent_inode, name FROM roots
+    UNION
+    SELECT n.inode, n.type,
+           CASE WHEN s.path = '/' THEN '/' || d.name ELSE s.path || '/' || d.name END,
+           d.parent_inode, d.name
+      FROM subtree s
+      JOIN vfs_dirents d ON d.parent_inode = s.inode
+      JOIN vfs_nodes n ON n.inode = d.child_inode
+     WHERE s.type = 'dir'
+  )`;
+
 interface BufferCleanup {
   inode: number;
   entry: WriteBufferEntry;
@@ -168,6 +197,92 @@ function deferBufferCleanup(db: Database, cleanup: readonly BufferCleanup[]): vo
       }
     }
   });
+}
+
+export function removeRootSet(
+  db: Database,
+  roots: readonly RemovalRoot[],
+  removed: readonly RemovalRoot[],
+  rev: number,
+): void {
+  const encodedRoots = JSON.stringify(
+    roots.map((root) => [root.inode, root.type, root.path, root.parentInode, root.name]),
+  );
+  const removedInodes = new Set(removed.map((entry) => entry.inode));
+  const removedPaths = new Set(removed.map((entry) => entry.path));
+  const bufferCandidates = collectRootSetBufferCandidates(db, removedInodes, removedPaths);
+
+  db.run(
+    `${ROOT_SET_CTE}
+     INSERT INTO vfs_changes (rev, path, op)
+     SELECT ?, path, 'delete' FROM subtree ORDER BY path`,
+    encodedRoots,
+    rev,
+  );
+
+  const keepExternalLinks = `AND NOT EXISTS (
+    SELECT 1
+      FROM vfs_dirents external
+     WHERE external.child_inode = target.inode
+       AND external.parent_inode NOT IN (SELECT inode FROM subtree WHERE type = 'dir')
+       AND NOT EXISTS (
+         SELECT 1 FROM roots
+          WHERE roots.inode = target.inode
+            AND roots.parent_inode = external.parent_inode
+            AND roots.name = external.name
+       )
+  )`;
+  db.run(
+    `${ROOT_SET_CTE}
+     DELETE FROM vfs_chunks AS target
+      WHERE target.inode IN (SELECT inode FROM subtree)
+        ${keepExternalLinks}`,
+    encodedRoots,
+  );
+  db.run(
+    `${ROOT_SET_CTE}
+     DELETE FROM vfs_nodes AS target
+      WHERE target.inode IN (SELECT inode FROM subtree)
+        ${keepExternalLinks}`,
+    encodedRoots,
+  );
+  db.run(
+    `${ROOT_SET_CTE}
+     DELETE FROM vfs_dirents
+      WHERE parent_inode IN (SELECT inode FROM subtree WHERE type = 'dir')
+         OR EXISTS (
+           SELECT 1 FROM roots
+            WHERE roots.parent_inode = vfs_dirents.parent_inode
+              AND roots.name = vfs_dirents.name
+         )`,
+    encodedRoots,
+  );
+
+  deferBufferCleanup(db, collectReapedBuffers(db, bufferCandidates));
+  for (const root of roots) invalidateResolveSubtree(db, root.path);
+}
+
+function collectRootSetBufferCandidates(
+  db: Database,
+  removedInodes: ReadonlySet<number>,
+  removedPaths: ReadonlySet<string>,
+): BufferCleanup[] {
+  const candidates: BufferCleanup[] = [];
+  for (const { inode, entry } of listWriteBufferEntries(db)) {
+    if (inode > 0 && removedInodes.has(inode)) {
+      candidates.push({ inode, entry });
+      continue;
+    }
+    const path = entry.pending?.resolvedPath;
+    if (path === undefined) continue;
+    for (const removed of removedPaths) {
+      if (path === removed || path.startsWith(`${removed}/`)) {
+        candidates.push({ inode, entry });
+        break;
+      }
+    }
+  }
+  return candidates;
 }
 
 export function rm(db: Database, path: string, options: RmOptions): void {

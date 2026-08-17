@@ -42,6 +42,23 @@ export interface ReadFilesOptions {
   cursor?: string;
 }
 
+export interface WriteFilesEntry {
+  path: string;
+  content: string | Uint8Array;
+  mode?: number;
+}
+
+export interface WriteFilesOptions {
+  maxBytes: number;
+}
+
+export interface RmFilesOptions {
+  recursive?: boolean;
+  force?: boolean;
+  maxEntries: number;
+  maxMetadataBytes: number;
+}
+
 export function bulkRequestDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }

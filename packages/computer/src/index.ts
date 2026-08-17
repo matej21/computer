@@ -22,10 +22,13 @@ export type {
   DurableObjectStorageLike,
   ReadFilesEntry,
   ReadFilesOptions,
+  RmFilesOptions,
   SkippedEntry,
   SQLiteWorkspaceProviderOptions,
   WalkOptions,
   WorkspaceWalkEntry,
+  WriteFilesEntry,
+  WriteFilesOptions,
 } from "@cloudflare/dofs";
 export { SQLiteWorkspaceProvider } from "@cloudflare/dofs";
 export type { BackendHandle, WorkspaceBackend } from "./backend.js";
