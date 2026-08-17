@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { flushWriteBatchBeforeMutation } from "../fs/writeBatch.js";
 import type { Database } from "../storage.js";
 
 // A manifest names the ordered chunk list for a single file. Two
@@ -21,6 +22,12 @@ export const MANIFEST_VERSION = 1;
 interface EncodedManifest {
   version: number;
   chunks: { hash: string; size: number }[];
+}
+
+export interface PreparedManifest {
+  encoded: Uint8Array;
+  hash: Uint8Array;
+  size: number;
 }
 
 function toHex(bytes: Uint8Array): string {
@@ -55,19 +62,27 @@ export function computeManifestHash(chunks: ManifestChunk[]): Uint8Array {
   return sha256(encodeManifest(chunks));
 }
 
+export function prepareManifest(chunks: ManifestChunk[]): PreparedManifest {
+  const encoded = encodeManifest(chunks);
+  return {
+    encoded,
+    hash: sha256(encoded),
+    size: chunks.reduce((acc, chunk) => acc + chunk.size, 0),
+  };
+}
+
 // Build a manifest row for the given chunk list. Idempotent: a
 // second call with the same chunks no-ops on the UNIQUE(hash). The
 // returned hash is what the caller writes onto
 // `vfs_nodes.manifest_hash`.
 export function buildManifest(db: Database, chunks: ManifestChunk[], now: number): Uint8Array {
-  const bytes = encodeManifest(chunks);
-  const hash = sha256(bytes);
-  const size = chunks.reduce((acc, c) => acc + c.size, 0);
+  flushWriteBatchBeforeMutation(db);
+  const { encoded, hash, size } = prepareManifest(chunks);
   db.run(
     "INSERT INTO vfs_manifests (hash, size, encoded, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(hash) DO UPDATE SET last_seen = excluded.last_seen",
     hash,
     size,
-    bytes,
+    encoded,
     now,
   );
   return hash;

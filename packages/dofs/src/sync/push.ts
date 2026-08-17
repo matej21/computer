@@ -1,4 +1,5 @@
 import { createWorkspaceError } from "../errors.js";
+import { flushWriteBatchBeforeRead } from "../fs/writeBatch.js";
 import type { Database } from "../storage.js";
 
 // Stream chunk bytes by hash. The receiver collects these into the
@@ -10,7 +11,15 @@ import type { Database } from "../storage.js";
 // (container → DO) both use this same shape; on the wire it is
 // fetchObjects on one side and pushObjects on the other. Both names
 // resolve to the same SQL.
-export async function* pushObjects(
+export function pushObjects(
+  db: Database,
+  hashes: Uint8Array[],
+): AsyncIterable<{ hash: Uint8Array; bytes: Uint8Array }> {
+  flushWriteBatchBeforeRead(db);
+  return pushObjectsAfterBarrier(db, hashes);
+}
+
+async function* pushObjectsAfterBarrier(
   db: Database,
   hashes: Uint8Array[],
 ): AsyncIterable<{ hash: Uint8Array; bytes: Uint8Array }> {

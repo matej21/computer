@@ -1,3 +1,4 @@
+import { flushWriteBatchBeforeRead } from "../fs/writeBatch.js";
 import type { Database } from "../storage.js";
 import { type ChangeEntry, materialiseChange } from "./changes.js";
 import { isIgnored } from "./ignore.js";
@@ -32,10 +33,19 @@ export interface CoalesceOptions {
   through?: ChangeCursor;
 }
 
-export async function* coalesceChanges(
+export function coalesceChanges(
   db: Database,
   after: ChangeCursor | number,
   options: CoalesceOptions = {},
+): AsyncIterable<ChangeEntry> {
+  flushWriteBatchBeforeRead(db);
+  return coalesceChangesAfterBarrier(db, after, options);
+}
+
+async function* coalesceChangesAfterBarrier(
+  db: Database,
+  after: ChangeCursor | number,
+  options: CoalesceOptions,
 ): AsyncIterable<ChangeEntry> {
   const ignore = options.ignore ?? [];
   const cursor = typeof after === "number" ? { rev: after, path: null } : after;

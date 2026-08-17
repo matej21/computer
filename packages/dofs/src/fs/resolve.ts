@@ -9,6 +9,7 @@ import {
   storeOperationNodeCache,
   storeResolveCache,
 } from "./resolveCache.js";
+import { flushWriteBatchBeforeRead } from "./writeBatch.js";
 
 export interface ResolvedInode {
   inode: number;
@@ -64,6 +65,7 @@ export function resolveInode(
   path: string,
   options: ResolveOptions = {},
 ): ResolvedInode | null {
+  flushWriteBatchBeforeRead(db);
   const followFinal = options.followSymlinks !== false;
   const { parts, path: canonical } = canonicalizePath(path);
 
