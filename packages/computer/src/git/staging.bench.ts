@@ -2,9 +2,9 @@
 
 import { performance } from "node:perf_hooks";
 
-import git from "isomorphic-git";
+import git, { type FsClient, type PromiseFsClient } from "isomorphic-git";
 import { fs as memfs, vol } from "memfs";
-import { beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { addWith, type IsomorphicGitAddClient } from "./staging.js";
 
@@ -16,15 +16,47 @@ const SCENARIO = {
 };
 const AUTHOR = { name: "benchmark", email: "benchmark@example.test" };
 
+function isPromiseFsClient(fs: object): fs is PromiseFsClient {
+  if (!("promises" in fs) || typeof fs.promises !== "object" || fs.promises === null) {
+    return false;
+  }
+  const promises = fs.promises;
+  return (
+    "readFile" in promises &&
+    typeof promises.readFile === "function" &&
+    "writeFile" in promises &&
+    typeof promises.writeFile === "function" &&
+    "unlink" in promises &&
+    typeof promises.unlink === "function" &&
+    "readdir" in promises &&
+    typeof promises.readdir === "function" &&
+    "mkdir" in promises &&
+    typeof promises.mkdir === "function" &&
+    "rmdir" in promises &&
+    typeof promises.rmdir === "function" &&
+    "stat" in promises &&
+    typeof promises.stat === "function" &&
+    "lstat" in promises &&
+    typeof promises.lstat === "function"
+  );
+}
+
+function requireFsClient(fs: object): FsClient {
+  if (!isPromiseFsClient(fs)) {
+    throw new TypeError("expected the isomorphic-git promise filesystem methods");
+  }
+  return fs;
+}
+
 const addClient: IsomorphicGitAddClient = {
-  async add({ fs: _fs, ...args }) {
-    await git.add({ fs: memfs, ...args });
+  async add({ fs, ...args }) {
+    await git.add({ fs: requireFsClient(fs), ...args });
   },
-  async statusMatrix({ fs: _fs, ...args }) {
-    return git.statusMatrix({ fs: memfs, ...args });
+  async statusMatrix({ fs, ...args }) {
+    return git.statusMatrix({ fs: requireFsClient(fs), ...args });
   },
-  async remove({ fs: _fs, ...args }) {
-    await git.remove({ fs: memfs, ...args });
+  async remove({ fs, ...args }) {
+    await git.remove({ fs: requireFsClient(fs), ...args });
   },
 };
 
@@ -38,14 +70,18 @@ async function stage(): Promise<void> {
 }
 
 beforeEach(() => vol.reset());
+afterEach(() => vi.useRealTimers());
 
 test("explicit staging reads contents and extra metadata in proportion to changed paths", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-08-17T12:00:00.000Z"));
   const sourceDirectory = `${SCENARIO.directory}/${SCENARIO.pathspec}`;
   await memfs.promises.mkdir(sourceDirectory, { recursive: true });
   for (let index = 0; index < SCENARIO.fixtureFiles; index++) {
     await memfs.promises.writeFile(`${sourceDirectory}/file-${index}.txt`, `before ${index}\n`);
   }
   await git.init({ fs: memfs, dir: SCENARIO.directory, defaultBranch: "main" });
+  vi.setSystemTime(new Date("2026-08-17T12:00:01.000Z"));
   await stage();
   await git.commit({
     fs: memfs,
@@ -54,12 +90,14 @@ test("explicit staging reads contents and extra metadata in proportion to change
     author: AUTHOR,
   });
 
+  vi.setSystemTime(new Date("2026-08-17T12:00:02.000Z"));
   for (let index = 0; index < SCENARIO.changedFiles; index++) {
     await memfs.promises.writeFile(`${sourceDirectory}/file-${index}.txt`, `after ${index}\n`);
   }
 
   const baselineLstat = vi.spyOn(memfs.promises, "lstat");
   const baselineStat = vi.spyOn(memfs.promises, "stat");
+  const baselineMapSet = vi.spyOn(Map.prototype, "set");
   await git.statusMatrix({
     fs: memfs,
     dir: SCENARIO.directory,
@@ -67,12 +105,19 @@ test("explicit staging reads contents and extra metadata in proportion to change
   });
   const baselineLstatOperations = baselineLstat.mock.calls.length;
   const baselineStatOperations = baselineStat.mock.calls.length;
+  const baselinePathMapKeys = baselineMapSet.mock.calls
+    .map(([key]) => key)
+    .filter(
+      (key): key is string => typeof key === "string" && key.startsWith(`${sourceDirectory}/`),
+    );
   baselineLstat.mockRestore();
   baselineStat.mockRestore();
+  baselineMapSet.mockRestore();
 
   const readFile = vi.spyOn(memfs.promises, "readFile");
   const lstat = vi.spyOn(memfs.promises, "lstat");
   const stat = vi.spyOn(memfs.promises, "stat");
+  const stagingMapSet = vi.spyOn(Map.prototype, "set");
   const startedAt = performance.now();
   await stage();
   const elapsedMs = performance.now() - startedAt;
@@ -87,9 +132,15 @@ test("explicit staging reads contents and extra metadata in proportion to change
   const worktreeStatOperations = stat.mock.calls.filter(([path]) =>
     String(path).startsWith(`${sourceDirectory}/`),
   ).length;
+  const stagingPathMapKeys = stagingMapSet.mock.calls
+    .map(([key]) => key)
+    .filter(
+      (key): key is string => typeof key === "string" && key.startsWith(`${sourceDirectory}/`),
+    );
   readFile.mockRestore();
   lstat.mockRestore();
   stat.mockRestore();
+  stagingMapSet.mockRestore();
 
   const contentFilesRead = [...new Set(worktreeReads)].filter((path) =>
     /\/file-\d+\.txt$/.test(path),
@@ -103,6 +154,10 @@ test("explicit staging reads contents and extra metadata in proportion to change
   const stagingMetadataOperations = stagingLstatOperations + stagingStatOperations;
   const metadataOperationOverhead = stagingMetadataOperations - baselineMetadataOperations;
   const metadataOperationTarget = SCENARIO.changedFiles * 4 + 2;
+  const baselinePathMapEntries = new Set(baselinePathMapKeys).size;
+  const stagingPathMapEntries = new Set(stagingPathMapKeys).size;
+  const metadataTrackingEntries = stagingPathMapEntries - baselinePathMapEntries;
+  const metadataTrackingEntryTarget = SCENARIO.changedFiles * 2 + 2;
   const report = {
     scenario: "explicit-directory-pathspec",
     fixtureFiles: SCENARIO.fixtureFiles,
@@ -119,6 +174,10 @@ test("explicit staging reads contents and extra metadata in proportion to change
     worktreeStatOperations,
     metadataOperationOverhead,
     metadataOperationTarget,
+    baselinePathMapEntries,
+    stagingPathMapEntries,
+    metadataTrackingEntries,
+    metadataTrackingEntryTarget,
     elapsedMs: Number(elapsedMs.toFixed(2)),
   };
   console.log(`GIT_STAGING_BENCH ${JSON.stringify(report)}`);
@@ -134,4 +193,5 @@ test("explicit staging reads contents and extra metadata in proportion to change
   expect(unchangedFilesRead).toBe(0);
   expect(contentFilesRead.length).toBeLessThanOrEqual(SCENARIO.changedFiles);
   expect(metadataOperationOverhead).toBeLessThanOrEqual(metadataOperationTarget);
+  expect(metadataTrackingEntries).toBeLessThanOrEqual(metadataTrackingEntryTarget);
 });
