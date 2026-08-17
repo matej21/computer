@@ -42,6 +42,7 @@
 import { trackStub, untrackStub } from "@cloudflare/computer-rpc/debug";
 import type {
   BulkPage,
+  CpOptions,
   FindOptions,
   GrepOptions,
   MkdirOptions,
@@ -208,6 +209,15 @@ export class WorkspaceFilesystemStub extends RpcTarget {
       "workspace.fs.readFiles",
       { "workspace.fs.paths": paths.length },
       () => this.#ws.fs.readFiles(paths, options),
+    );
+  }
+
+  cp(source: string, dest: string, options: CpOptions = {}): Promise<void> {
+    return withSpan(
+      this.#ws.observer,
+      "workspace.fs.cp",
+      { "workspace.fs.source": source, "workspace.fs.dest": dest },
+      () => this.#ws.fs.cp(source, dest, options),
     );
   }
 

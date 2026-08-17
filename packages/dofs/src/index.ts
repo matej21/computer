@@ -1,6 +1,7 @@
 export type { WorkspaceErrorCode, WorkspaceFsError } from "./errors.js";
 export { createWorkspaceError } from "./errors.js";
 export { chmod } from "./fs/chmod.js";
+export { cp } from "./fs/cp.js";
 export {
   WorkspaceFilesystem,
   type WorkspaceFilesystemOptions,
@@ -27,6 +28,7 @@ export {
 export type {
   BulkEntryError,
   BulkPage,
+  CpOptions,
   ReadFilesEntry,
   ReadFilesOptions,
   RmFilesOptions,

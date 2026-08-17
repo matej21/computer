@@ -59,6 +59,12 @@ export interface RmFilesOptions {
   maxMetadataBytes: number;
 }
 
+export interface CpOptions {
+  recursive?: boolean;
+  maxEntries?: number;
+  maxMetadataBytes?: number;
+}
+
 export function bulkRequestDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }

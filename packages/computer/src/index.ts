@@ -19,6 +19,7 @@ export type {
   ApplyResult,
   BulkEntryError,
   BulkPage,
+  CpOptions,
   DurableObjectStorageLike,
   ReadFilesEntry,
   ReadFilesOptions,
