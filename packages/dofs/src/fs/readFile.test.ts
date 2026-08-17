@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { clearBlobCache } from "./blobCache.js";
 import { mkdir } from "./mkdir.js";
 import { readFile } from "./readFile.js";
+import { symlink } from "./symlink.js";
 import { withDB } from "./with-db.js";
 import {
   CHUNK_SIZE,
@@ -52,6 +54,27 @@ describe("readFile", () => {
     await withDB(async (db) => {
       await writeFile(db, "/a.txt", "hello", {}, () => 0);
       expect(await readFile(db, "/a.txt", { encoding: "utf8" })).toBe("hello");
+    });
+  });
+
+  it("reads a small complete file through a symlink", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/target.txt", "hello", {}, () => 0);
+      symlink(db, "/target.txt", "/link.txt", () => 0);
+
+      expect(await readFile(db, "/link.txt", "utf8")).toBe("hello");
+    });
+  });
+
+  it("reports EIO when a small complete file has lost its blob", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/small.txt", "hello", {}, () => 0);
+      db.run("DELETE FROM vfs_blob_bytes");
+      clearBlobCache(db);
+
+      await expect(readFile(db, "/small.txt", "utf8")).rejects.toMatchObject({ code: "EIO" });
+      const stream = await readFile(db, "/small.txt");
+      await expect(drain(stream)).rejects.toMatchObject({ code: "EIO" });
     });
   });
 
