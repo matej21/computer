@@ -2,7 +2,7 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { CountingStorage } from "../bench/counting-storage.js";
 import type * as publicApi from "../index.js";
-import { initializeSchema } from "../schema/index.js";
+import { initializeSchema, ROOT_INODE } from "../schema/index.js";
 import { Database, type Database as DatabaseType, isDatabaseOperationView } from "../storage.js";
 import { coalesceChanges } from "../sync/coalesce.js";
 import { hasObjects } from "../sync/fetch.js";
@@ -134,11 +134,21 @@ function jsonArrayLength(value: unknown): number {
 
 function jsonBindingByteLengths(storage: InspectingStorage): number[] {
   return storage.statements.flatMap((statement) =>
-    statement.query.includes("INSERT INTO vfs_") && statement.query.includes("json_each")
+    statement.query.includes("json_each")
       ? statement.bindings.flatMap((binding) =>
           typeof binding === "string" ? [encoder.encode(binding).byteLength] : [],
         )
       : [],
+  );
+}
+
+function targetPreflightStatements(storage: InspectingStorage): ExecutedStatement[] {
+  return storage.statements.filter((statement) => statement.query.includes("WITH targets AS"));
+}
+
+function wroteBatchRevision(storage: InspectingStorage): boolean {
+  return storage.statements.some((statement) =>
+    statement.query.includes("UPDATE vfs_meta SET v = v + ?"),
   );
 }
 
@@ -576,6 +586,139 @@ describe("synchronous write batches", () => {
       const pageBytes = jsonBindingByteLengths(storage);
       expect(pageBytes.length).toBeGreaterThan(0);
       expect(Math.max(...pageBytes)).toBeLessThanOrEqual(hardMaxMetadataPageBytes);
+    });
+  });
+
+  it("pages a full multibyte target preflight below the hard JSON bound", async () => {
+    await withInspectingDatabase((db, storage) => {
+      const parentInode = prepareDirectory(db);
+      storage.reset();
+      const hardMaxMetadataPageBytes = DEFAULT_WRITE_BATCH_LIMITS.maxMetadataPageBytes;
+
+      withWriteBatchSync(db, (batchDb: DatabaseType) => {
+        for (let index = 0; index < 1024; index += 1) {
+          const name = `${String(index).padStart(4, "0")}-${"ž".repeat(600)}`;
+          writeText(batchDb, `/ready/${name}`, "");
+        }
+      });
+
+      const targetPreflights = targetPreflightStatements(storage);
+      expect.soft(targetPreflights.length).toBeGreaterThan(1);
+      expect(childCount(db, parentInode)).toBe(1024);
+      expect(Math.max(...jsonBindingByteLengths(storage))).toBeLessThanOrEqual(
+        hardMaxMetadataPageBytes,
+      );
+    });
+  });
+
+  it("detects a late-page collision before revision and metadata writes", async () => {
+    await withInspectingDatabase((db, storage) => {
+      const parentInode = prepareDirectory(db);
+      const beforeRev = currentRev(db);
+      storage.reset();
+
+      expect(() =>
+        withWriteBatchSync(
+          db,
+          (batchDb: DatabaseType) => {
+            writeText(batchDb, "/ready/a.txt", "a");
+            writeText(batchDb, "/ready/b.txt", "b");
+            writeText(batchDb, "/ready/c.txt", "c");
+            batchDb.run(
+              `INSERT INTO vfs_nodes (inode, type, mode, mtime, rev)
+               VALUES (?, 'file', ?, ?, 0)`,
+              10_000,
+              0o644,
+              NOW(),
+            );
+            batchDb.run(
+              "INSERT INTO vfs_dirents (parent_inode, name, child_inode) VALUES (?, ?, ?)",
+              parentInode,
+              "c.txt",
+              10_000,
+            );
+          },
+          { metadataRowsPerPage: 1 },
+        ),
+      ).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+
+      expect
+        .soft(
+          targetPreflightStatements(storage).map((statement) =>
+            jsonArrayLength(statement.bindings[0]),
+          ),
+        )
+        .toEqual([1, 1, 1]);
+      expect(wroteBatchRevision(storage)).toBe(false);
+      expect(currentRev(db)).toBe(beforeRev);
+      expect(childNames(db, parentInode)).toEqual([]);
+    });
+  });
+
+  it("detects a late-page missing parent before revision and metadata writes", async () => {
+    await withInspectingDatabase((db, storage) => {
+      const firstParent = prepareDirectory(db, "/first");
+      const secondParent = prepareDirectory(db, "/second");
+      const thirdParent = prepareDirectory(db, "/third");
+      const beforeRev = currentRev(db);
+      storage.reset();
+
+      expect(() =>
+        withWriteBatchSync(
+          db,
+          (batchDb: DatabaseType) => {
+            writeText(batchDb, "/first/a.txt", "a");
+            writeText(batchDb, "/second/b.txt", "b");
+            writeText(batchDb, "/third/c.txt", "c");
+            batchDb.run(
+              "DELETE FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
+              ROOT_INODE,
+              "third",
+            );
+            batchDb.run("DELETE FROM vfs_nodes WHERE inode = ?", thirdParent);
+          },
+          { metadataRowsPerPage: 1 },
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ENOENT" }));
+
+      expect
+        .soft(
+          targetPreflightStatements(storage).map((statement) =>
+            jsonArrayLength(statement.bindings[0]),
+          ),
+        )
+        .toEqual([1, 1, 1]);
+      expect(wroteBatchRevision(storage)).toBe(false);
+      expect(currentRev(db)).toBe(beforeRev);
+      expect(resolveInode(db, "/third")?.inode).toBe(thirdParent);
+      expect(childNames(db, firstParent)).toEqual([]);
+      expect(childNames(db, secondParent)).toEqual([]);
+      expect(childNames(db, thirdParent)).toEqual([]);
+    });
+  });
+
+  it("falls back for an oversized parent bind without rejecting the valid path", async () => {
+    await withInspectingDatabase(async (db, storage) => {
+      const segment = "ž".repeat(300);
+      const parentPath = `/${segment}`;
+      const filePath = `${parentPath}/file.txt`;
+      const parentInode = prepareDirectory(db, parentPath);
+      const maxMetadataPageBytes = 512;
+      storage.reset();
+
+      withWriteBatchSync(
+        db,
+        (batchDb: DatabaseType) => {
+          writeText(batchDb, filePath, "content");
+          expect.soft(childCount(batchDb, parentInode)).toBe(1);
+        },
+        { maxMetadataPageBytes },
+      );
+
+      const pageBytes = jsonBindingByteLengths(storage);
+      expect(pageBytes.every((bytes) => bytes <= maxMetadataPageBytes)).toBe(true);
+      storage.reset();
+      expect(await readFile(db, filePath, "utf8")).toBe("content");
     });
   });
 
