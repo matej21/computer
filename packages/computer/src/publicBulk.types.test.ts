@@ -1,4 +1,4 @@
-import type { WorkspaceRPC } from "@cloudflare/computer-rpc";
+import type { ShellRPC, SyncRPC, WorkspaceRPC } from "@cloudflare/computer-rpc";
 import type {
   BulkEntryError,
   BulkPage,
@@ -149,9 +149,12 @@ it("publishes one assignable plain-value bulk filesystem surface", () => {
   assertType<IsEqual<WriteFilesOptions, ExpectedWriteFilesOptions>>();
   assertType<IsEqual<RmFilesOptions, ExpectedRmFilesOptions>>();
   assertType<IsEqual<CpOptions, ExpectedCpOptions>>();
+  assertType<IsAssignable<"ESTALE", WorkspaceErrorCode>>();
 
   assertType<IsEqual<ContainsStream<BulkPage<WorkspaceWalkEntry>>, false>>();
   assertType<IsEqual<ContainsStream<BulkPage<ReadFilesEntry>>, false>>();
   assertType<IsEqual<ContainsStream<readonly WriteFilesEntry[]>, false>>();
   assertType<IsEqual<Extract<keyof WorkspaceRPC, keyof PublicBulkFilesystem>, never>>();
+  assertType<IsEqual<Extract<keyof SyncRPC, keyof PublicBulkFilesystem>, never>>();
+  assertType<IsEqual<Extract<keyof ShellRPC, keyof PublicBulkFilesystem>, never>>();
 });
