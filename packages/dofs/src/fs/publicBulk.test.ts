@@ -9,6 +9,7 @@ import { WorkspaceFilesystem } from "./filesystem.js";
 import { link } from "./link.js";
 import { invalidateReadOnlyMountCache } from "./mount-guard.js";
 import { withDB } from "./with-db.js";
+import { listPendingWriteBuffers } from "./writeBuffer.js";
 
 const MIB = 1024 * 1024;
 const WALK_MAX_BYTES = MIB;
@@ -681,6 +682,63 @@ describe("public bounded bulk filesystem", () => {
           maxMetadataBytes: MUTATION_MAX_METADATA_BYTES + 1,
         }),
       ).rejects.toMatchObject({ code: "EINVAL" });
+    });
+  });
+
+  it("counts pending descendants against recursive removal entry budgets", async () => {
+    await withFs(async (fs) => {
+      await fs.mkdir("/tree", { recursive: true });
+      const provider = new SQLiteWorkspaceProvider(fs.db, { now: () => 1000 });
+      for (const name of ["a", "b"]) {
+        provider.openWriteBufferForCreateSync(`/tree/${name}`);
+        provider.writeRangeSync(`/tree/${name}`, name, 0);
+      }
+      const beforeRev = fs.db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'");
+
+      await expect(
+        fs.rmFiles(["/tree"], {
+          recursive: true,
+          maxEntries: 1,
+          maxMetadataBytes: MUTATION_MAX_METADATA_BYTES,
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+
+      expect(fs.db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'")).toBe(beforeRev);
+      expect(listPendingWriteBuffers(fs.db)).toHaveLength(2);
+      await expect(fs.stat("/tree")).resolves.toMatchObject({ isDirectory: true });
+      await expect(fs.readFile("/tree/a", "utf8")).resolves.toBe("a");
+      await expect(fs.readFile("/tree/b", "utf8")).resolves.toBe("b");
+      provider.releaseWriteBufferSync("/tree/a");
+      provider.releaseWriteBufferSync("/tree/b");
+      await expect(fs.readFile("/tree/a", "utf8")).resolves.toBe("a");
+      await expect(fs.readFile("/tree/b", "utf8")).resolves.toBe("b");
+    });
+  });
+
+  it("counts pending descendants against recursive removal metadata budgets", async () => {
+    await withFs(async (fs) => {
+      const root = "/metadata";
+      const pendingPath = `${root}/pending-name`;
+      await fs.mkdir(root, { recursive: true });
+      const provider = new SQLiteWorkspaceProvider(fs.db, { now: () => 1000 });
+      provider.openWriteBufferForCreateSync(pendingPath);
+      provider.writeRangeSync(pendingPath, "pending", 0);
+      const beforeRev = fs.db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'");
+
+      await expect(
+        fs.rmFiles([root], {
+          recursive: true,
+          maxEntries: 10,
+          maxMetadataBytes: new TextEncoder().encode(root).byteLength,
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+
+      expect(fs.db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'")).toBe(beforeRev);
+      expect(listPendingWriteBuffers(fs.db)).toHaveLength(1);
+      await expect(fs.stat(root)).resolves.toMatchObject({ isDirectory: true });
+      await expect(fs.readFile(pendingPath, "utf8")).resolves.toBe("pending");
+      provider.releaseWriteBufferSync(pendingPath);
+      await expect(fs.readFile(pendingPath, "utf8")).resolves.toBe("pending");
     });
   });
 
