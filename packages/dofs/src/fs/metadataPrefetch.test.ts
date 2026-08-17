@@ -347,6 +347,68 @@ describe("operation-local metadata prefetch", () => {
     });
   });
 
+  it("does not retain child metadata when find stops before completing a directory", async () => {
+    await withCountingDatabase((db, provider, counting) => {
+      writeFiles(provider, "/tree", ["a", "b", "c"]);
+      clearResolveCache(db);
+
+      withDatabaseOperation(
+        db,
+        (operationDb: Database) => {
+          expect(find(operationDb, "/tree", undefined, { limit: 1 })).toEqual([
+            { path: "/tree/a", type: "file" },
+          ]);
+          const before = counting.snapshot().statements;
+
+          expect(resolveInode(operationDb, "/tree/a")?.type).toBe("file");
+          expect(statementDelta(counting, before)).toBeGreaterThan(0);
+        },
+        prefetchOptions(),
+      );
+    });
+  });
+
+  it("does not retain child metadata when find prefetch has no byte budget", async () => {
+    await withCountingDatabase((db, provider, counting) => {
+      writeFiles(provider, "/tree", ["a", "b", "c"]);
+      clearResolveCache(db);
+
+      withDatabaseOperation(
+        db,
+        (operationDb: Database) => {
+          expect(find(operationDb, "/tree")).toHaveLength(3);
+          for (const name of ["a", "b", "c"]) {
+            const before = counting.snapshot().statements;
+            expect(resolveInode(operationDb, `/tree/${name}`)?.type).toBe("file");
+            expect(statementDelta(counting, before)).toBeGreaterThan(0);
+          }
+        },
+        prefetchOptions({ maxMetadataPrefetchBytes: 0 }),
+      );
+    });
+  });
+
+  it("does not retain child metadata from find when the directory exceeds its entry bound", async () => {
+    await withCountingDatabase((db, _provider, counting) => {
+      seedWideDirectory(db, "/wide", 129);
+      clearResolveCache(db);
+
+      withDatabaseOperation(
+        db,
+        (operationDb: Database) => {
+          expect(find(operationDb, "/wide")).toHaveLength(129);
+          let before = counting.snapshot().statements;
+          expect(resolveInode(operationDb, "/wide/f00000")?.type).toBe("file");
+          expect(statementDelta(counting, before)).toBeGreaterThan(0);
+          before = counting.snapshot().statements;
+          expect(resolveInode(operationDb, "/wide/f00128")?.type).toBe("file");
+          expect(statementDelta(counting, before)).toBeGreaterThan(0);
+        },
+        prefetchOptions({ maxMetadataPrefetchDirectoryEntries: 128 }),
+      );
+    });
+  });
+
   it("lets find warm path and node metadata for the rest of its operation", async () => {
     await withCountingDatabase((db, provider, counting) => {
       writeFiles(provider, "/tree", ["a", "b", "c"]);
