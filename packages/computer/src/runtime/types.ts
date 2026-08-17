@@ -1,5 +1,6 @@
 import type {
   BulkPage,
+  CpOptions,
   ReadFilesEntry,
   ReadFilesOptions,
   RmFilesOptions,
@@ -47,6 +48,7 @@ export interface WorkspaceRuntimeFilesystem {
   readFile(path: string, encoding: "utf8"): Promise<string>;
   walk(directory: string, options: WalkOptions): Promise<BulkPage<WorkspaceWalkEntry>>;
   readFiles(paths: readonly string[], options: ReadFilesOptions): Promise<BulkPage<ReadFilesEntry>>;
+  cp(source: string, dest: string, options?: CpOptions): Promise<void>;
   stat(path: string): Promise<WorkspaceRuntimeStat>;
   lstat(path: string): Promise<WorkspaceRuntimeStat>;
   readlink(path: string): Promise<string>;

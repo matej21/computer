@@ -16,12 +16,14 @@ import { withDatabaseOperation } from "../operation.js";
 import type { Database } from "../storage.js";
 
 import { chmod } from "./chmod.js";
+import { cp } from "./cp.js";
 import { type FindOptions, find, type WorkspaceFoundEntry } from "./find.js";
 import { type GrepOptions, grep, type WorkspaceGrepMatch } from "./grep.js";
 import { ls } from "./ls.js";
 import { type MkdirOptions, mkdir } from "./mkdir.js";
 import type {
   BulkPage,
+  CpOptions,
   ReadFilesEntry,
   ReadFilesOptions,
   RmFilesOptions,
@@ -153,6 +155,10 @@ export class WorkspaceFilesystem {
 
   async rmFiles(paths: readonly string[], options: RmFilesOptions): Promise<void> {
     rmFiles(this.db, paths, options);
+  }
+
+  async cp(source: string, dest: string, options: CpOptions = {}): Promise<void> {
+    cp(this.db, source, dest, options, this.now);
   }
 
   // Change the permission bits on a path. Follows symlinks like
