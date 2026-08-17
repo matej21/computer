@@ -12,6 +12,8 @@ import { benchmarkReport, readTable } from "./report.js";
 import { expectMetricSignature } from "./signature.js";
 
 const DIRECTORY_WIDTH = 40;
+const NARROW_DIRECTORY_WIDTH = 2001;
+const WIDE_DIRECTORY_WIDTH = 20_001;
 const TIMING_GROUPS = 100;
 
 const baselineFortyReads: StatementCounts = {
@@ -19,7 +21,7 @@ const baselineFortyReads: StatementCounts = {
   reads: 80,
   writes: 0,
   other: 0,
-  rowsRead: 440,
+  rowsRead: 8999,
   rowsWritten: 0,
 };
 
@@ -28,7 +30,7 @@ const targetFortyReads: StatementCounts = {
   reads: 11,
   writes: 0,
   other: 0,
-  rowsRead: 326,
+  rowsRead: 1855,
   rowsWritten: 0,
 };
 
@@ -37,7 +39,7 @@ const targetTwoReads: StatementCounts = {
   reads: 4,
   writes: 0,
   other: 0,
-  rowsRead: 22,
+  rowsRead: 450,
   rowsWritten: 0,
 };
 
@@ -87,6 +89,55 @@ async function measure(readCount: number, name: string): Promise<ReadBenchmarkRe
   return { name, depth: 2, nsPerOp, ...counts };
 }
 
+async function measureWideDirectoryTrigger(directoryWidth: number): Promise<StatementCounts> {
+  return withCountingDb(async (db, provider, counting) => {
+    const directory = "/wide";
+    provider.mkdirSync(directory);
+    const paths: string[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      const path = `${directory}/a-prime-${index}`;
+      provider.writeFileSync(path, `prime ${index}`);
+      paths.push(path);
+    }
+
+    const parentInode = db.scalar<number>(
+      "SELECT child_inode FROM vfs_dirents WHERE parent_inode = 1 AND name = 'wide'",
+    );
+    if (parentInode === undefined) throw new Error("wide fixture directory is missing");
+    const fillerCount = directoryWidth - paths.length;
+    const firstInode =
+      (db.scalar<number>("SELECT COALESCE(MAX(inode), 0) FROM vfs_nodes") ?? 0) + 1;
+    db.transactionSync(() => {
+      db.run(
+        `WITH RECURSIVE sequence(value) AS (
+           SELECT 0
+           UNION ALL
+           SELECT value + 1 FROM sequence WHERE value + 1 < ?
+         )
+         INSERT INTO vfs_nodes (type, mode, mtime, rev, size)
+         SELECT 'file', ?, 1000, 0, 0 FROM sequence`,
+        fillerCount,
+        0o644,
+      );
+      db.run(
+        `INSERT INTO vfs_dirents (parent_inode, name, child_inode)
+         SELECT ?, printf('m-empty-%05d', inode - ?), inode
+           FROM vfs_nodes
+          WHERE inode >= ?
+          ORDER BY inode`,
+        parentInode,
+        firstInode,
+        firstInode,
+      );
+    });
+
+    resetReadCaches(db);
+    counting.reset();
+    await readPaths(db, paths);
+    return counting.snapshot();
+  });
+}
+
 it("benchmarks one-shot small sibling read-ahead against real DO SqlStorage", async () => {
   const forty = await measure(DIRECTORY_WIDTH, "40 complete sibling reads");
   const incidental = await measure(2, "2 incidental sibling reads");
@@ -114,4 +165,16 @@ it("benchmarks one-shot small sibling read-ahead against real DO SqlStorage", as
   expectMetricSignature(forty.name, forty, targetFortyReads);
   expectMetricSignature(incidental.name, incidental, targetTwoReads);
   expect(forty.statements).toBeLessThan(baselineFortyReads.statements);
+});
+
+it("bounds trigger rows without counting every wide-directory candidate", async () => {
+  const narrow = await measureWideDirectoryTrigger(NARROW_DIRECTORY_WIDTH);
+  const wide = await measureWideDirectoryTrigger(WIDE_DIRECTORY_WIDTH);
+
+  // A sentinel may select one more bounded keyset page, independent of the remaining width.
+  expect(wide.statements).toBeLessThanOrEqual(narrow.statements + 1);
+  expect(
+    wide.rowsRead,
+    `wide trigger read ${wide.rowsRead} rows after narrow trigger read ${narrow.rowsRead}`,
+  ).toBeLessThanOrEqual(narrow.rowsRead * 3);
 });
