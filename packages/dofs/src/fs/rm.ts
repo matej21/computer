@@ -1,98 +1,173 @@
 import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import { incrementRev } from "../rev.js";
-import type { Database } from "../storage.js";
+import { type Database, persistentDatabaseView, registerAfterOutermostCommit } from "../storage.js";
 import { recordDelete } from "../sync/changes.js";
 import { pathOf } from "../sync/paths.js";
 import { assertNotReadOnly } from "./mount-guard.js";
 import { resolveInode } from "./resolve.js";
 import { invalidateResolveExact, invalidateResolveSubtree } from "./resolveCache.js";
 import { unlinkDirent } from "./unlink.js";
+import {
+  deleteWriteBuffer,
+  getWriteBuffer,
+  listWriteBufferEntries,
+  type WriteBufferEntry,
+} from "./writeBuffer.js";
 
 export interface RmOptions {
   recursive?: boolean;
   force?: boolean;
 }
 
-interface DirChild {
-  name: string;
-  child_inode: number;
-  type: "file" | "dir" | "symlink";
+const SUBTREE_CTE = `WITH RECURSIVE subtree(inode, type, path) AS (
+  SELECT ?, 'dir', ?
+  UNION ALL
+  SELECT n.inode, n.type,
+         CASE WHEN s.path = '/' THEN '/' || d.name ELSE s.path || '/' || d.name END
+    FROM subtree s
+    JOIN vfs_dirents d ON d.parent_inode = s.inode
+    JOIN vfs_nodes n ON n.inode = d.child_inode
+   WHERE s.type = 'dir'
+)`;
+
+const DELETE_PAGE = 10_000;
+
+interface BufferCleanup {
+  inode: number;
+  entry: WriteBufferEntry;
 }
 
-// Walk a directory subtree post-order so we delete leaves before
-// parents. Yields each node together with the parent inode and name
-// the walk already knows, so the caller can unlink the dirent by
-// (parent, name) without re-resolving the parent from root. The caller
-// appends one tombstone per yielded path and clears vfs_chunks for
-// file inodes.
-function* walkPostOrder(
+function removeSubtree(
   db: Database,
   rootInode: number,
   rootPath: string,
   rootParentInode: number,
   rootName: string,
-): Generator<{
-  path: string;
-  inode: number;
-  type: "file" | "dir" | "symlink";
-  parentInode: number;
-  name: string;
-}> {
-  // Stack-based DFS to avoid recursion limits on deep trees.
-  type Frame = {
-    inode: number;
-    path: string;
-    type: "file" | "dir" | "symlink";
-    parentInode: number;
-    name: string;
-    expanded: boolean;
-  };
-  const stack: Frame[] = [
-    {
-      inode: rootInode,
-      path: rootPath,
-      type: "dir",
-      parentInode: rootParentInode,
-      name: rootName,
-      expanded: false,
-    },
-  ];
+  rev: number,
+): void {
+  db.run(
+    `${SUBTREE_CTE}
+     INSERT INTO vfs_changes (rev, path, op)
+     SELECT ?, path, 'delete' FROM subtree ORDER BY path`,
+    rootInode,
+    rootPath,
+    rev,
+  );
 
-  while (stack.length > 0) {
-    const top = stack[stack.length - 1];
-    if (top.type !== "dir" || top.expanded) {
-      stack.pop();
-      yield {
-        path: top.path,
-        inode: top.inode,
-        type: top.type,
-        parentInode: top.parentInode,
-        name: top.name,
-      };
-      continue;
-    }
-    top.expanded = true;
-    const children = db.all<DirChild>(
-      `SELECT d.name AS name, d.child_inode AS child_inode, n.type AS type
-         FROM vfs_dirents d
-         JOIN vfs_nodes n ON n.inode = d.child_inode
-        WHERE d.parent_inode = ?
-        ORDER BY d.name`,
-      top.inode,
-    );
-    for (const child of children) {
-      const childPath = top.path === "/" ? `/${child.name}` : `${top.path}/${child.name}`;
-      stack.push({
-        inode: child.child_inode,
-        path: childPath,
-        type: child.type,
-        parentInode: top.inode,
-        name: child.name,
-        expanded: false,
-      });
+  const keepExternalLinks = `AND NOT EXISTS (
+    SELECT 1
+      FROM vfs_dirents external
+     WHERE external.child_inode = target.inode
+       AND external.parent_inode NOT IN (SELECT inode FROM subtree WHERE type = 'dir')
+       AND NOT (
+         target.inode = ? AND external.parent_inode = ? AND external.name = ?
+       )
+  )`;
+  db.run(
+    `${SUBTREE_CTE}
+     DELETE FROM vfs_chunks AS target
+      WHERE target.inode IN (SELECT inode FROM subtree)
+        ${keepExternalLinks}`,
+    rootInode,
+    rootPath,
+    rootInode,
+    rootParentInode,
+    rootName,
+  );
+  db.run(
+    `${SUBTREE_CTE}
+     DELETE FROM vfs_nodes AS target
+      WHERE target.inode IN (SELECT inode FROM subtree)
+        ${keepExternalLinks}`,
+    rootInode,
+    rootPath,
+    rootInode,
+    rootParentInode,
+    rootName,
+  );
+  db.run(
+    `WITH RECURSIVE subtree(inode) AS (
+       SELECT ?
+       UNION
+       SELECT d.child_inode
+         FROM subtree s
+         JOIN vfs_dirents d ON d.parent_inode = s.inode
+     )
+     DELETE FROM vfs_dirents
+      WHERE parent_inode IN (SELECT inode FROM subtree)
+         OR (parent_inode = ? AND name = ?)`,
+    rootInode,
+    rootParentInode,
+    rootName,
+  );
+}
+
+function collectBufferCandidates(
+  db: Database,
+  rootInode: number,
+  rootPath: string,
+): BufferCleanup[] {
+  const entries = listWriteBufferEntries(db);
+  const byInode = new Map(entries.map(({ inode, entry }) => [inode, entry]));
+  const candidates: BufferCleanup[] = [];
+  const prefix = `${rootPath}/`;
+  for (const { inode, entry } of entries) {
+    const pending = entry.pending;
+    if (pending?.resolvedPath.startsWith(prefix)) {
+      candidates.push({ inode, entry });
     }
   }
+
+  const persisted = entries.filter(({ inode }) => inode > 0).map(({ inode }) => inode);
+  for (let start = 0; start < persisted.length; start += DELETE_PAGE) {
+    const page = JSON.stringify(persisted.slice(start, start + DELETE_PAGE));
+    for (const row of db.all<{ inode: number }>(
+      `${SUBTREE_CTE}
+       SELECT DISTINCT subtree.inode AS inode
+         FROM subtree
+         JOIN json_each(?) candidate ON candidate.value = subtree.inode`,
+      rootInode,
+      rootPath,
+      page,
+    )) {
+      const entry = byInode.get(row.inode);
+      if (entry !== undefined) candidates.push({ inode: row.inode, entry });
+    }
+  }
+  return candidates;
+}
+
+function collectReapedBuffers(db: Database, candidates: readonly BufferCleanup[]): BufferCleanup[] {
+  const reaped = candidates.filter((candidate) => candidate.inode < 0);
+  const persisted = candidates.filter((candidate) => candidate.inode > 0);
+  for (let start = 0; start < persisted.length; start += DELETE_PAGE) {
+    const page = persisted.slice(start, start + DELETE_PAGE);
+    const surviving = new Set(
+      db
+        .all<{ inode: number }>(
+          "SELECT inode FROM vfs_nodes WHERE inode IN (SELECT value FROM json_each(?))",
+          JSON.stringify(page.map((candidate) => candidate.inode)),
+        )
+        .map((row) => row.inode),
+    );
+    for (const candidate of page) {
+      if (!surviving.has(candidate.inode)) reaped.push(candidate);
+    }
+  }
+  return reaped;
+}
+
+function deferBufferCleanup(db: Database, cleanup: readonly BufferCleanup[]): void {
+  if (cleanup.length === 0) return;
+  const persistentDb = persistentDatabaseView(db);
+  registerAfterOutermostCommit(db, () => {
+    for (const target of cleanup) {
+      if (getWriteBuffer(persistentDb, target.inode) === target.entry) {
+        deleteWriteBuffer(persistentDb, target.inode);
+      }
+    }
+  });
 }
 
 export function rm(db: Database, path: string, options: RmOptions): void {
@@ -165,15 +240,9 @@ export function rm(db: Database, path: string, options: RmOptions): void {
       return;
     }
 
-    // Recursive directory removal. Walk leaves first so each delete
-    // sees an empty parent by the time we get to it. File entries may
-    // be hardlinked outside this subtree, so delete by path rather
-    // than by child inode. The walk carries each node's parent inode
-    // and name, so unlinkDirent needs no per-node re-resolve from root.
-    for (const entry of walkPostOrder(db, node.inode, realPath, parent.inode, name)) {
-      unlinkDirent(db, entry.parentInode, entry.name, entry.inode, entry.type);
-      recordDelete(db, rev, entry.path);
-    }
+    const bufferCandidates = collectBufferCandidates(db, node.inode, realPath);
+    removeSubtree(db, node.inode, realPath, parent.inode, name, rev);
+    deferBufferCleanup(db, collectReapedBuffers(db, bufferCandidates));
     // The whole subtree under realPath is gone; one subtree drop covers
     // every descendant's cached resolution.
     invalidateResolveSubtree(db, realPath);
