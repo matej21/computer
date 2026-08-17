@@ -98,6 +98,82 @@ describe("writeFile", () => {
     });
   });
 
+  it("stores final metadata and a manifest on a newly written node", async () => {
+    await withDB(async (db) => {
+      const bytes = new TextEncoder().encode("complete node");
+      const beforeRev = db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'") ?? 0;
+
+      writeFileSync(db, "/complete.txt", bytes, { mode: 0o754 }, () => 4321);
+
+      const node = db.one<{
+        inode: number;
+        type: "file" | "dir" | "symlink";
+        mode: number;
+        mtime: number;
+        rev: number;
+        size: number;
+        manifest_hash: Uint8Array | null;
+      }>(
+        `SELECT n.inode, n.type, n.mode, n.mtime, n.rev, n.size, n.manifest_hash
+           FROM vfs_nodes n
+           JOIN vfs_dirents d ON d.child_inode = n.inode
+          WHERE d.parent_inode = ? AND d.name = ?`,
+        ROOT_INODE,
+        "complete.txt",
+      );
+      if (node === undefined) throw new Error("created node is missing");
+
+      expect(node).toMatchObject({
+        type: "file",
+        mode: 0o754,
+        mtime: 4321,
+        rev: beforeRev + 1,
+        size: bytes.byteLength,
+      });
+      expect(node.manifest_hash).toBeInstanceOf(Uint8Array);
+      expect(node.manifest_hash?.byteLength).toBe(32);
+      expect(
+        db.scalar<number>("SELECT size FROM vfs_manifests WHERE hash = ?", node.manifest_hash),
+      ).toBe(bytes.byteLength);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM vfs_chunks WHERE inode = ?", node.inode)).toBe(
+        1,
+      );
+    });
+  });
+
+  it("stores an empty new file with its final revision and manifest", async () => {
+    await withDB(async (db) => {
+      const beforeRev = db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'") ?? 0;
+
+      writeFileSync(db, "/empty-complete.txt", new Uint8Array(), {}, () => 7654);
+
+      const node = db.one<{
+        inode: number;
+        rev: number;
+        size: number;
+        mtime: number;
+        manifest_hash: Uint8Array | null;
+      }>(
+        `SELECT n.inode, n.rev, n.size, n.mtime, n.manifest_hash
+           FROM vfs_nodes n
+           JOIN vfs_dirents d ON d.child_inode = n.inode
+          WHERE d.parent_inode = ? AND d.name = ?`,
+        ROOT_INODE,
+        "empty-complete.txt",
+      );
+      if (node === undefined) throw new Error("created empty node is missing");
+
+      expect(node).toMatchObject({ rev: beforeRev + 1, size: 0, mtime: 7654 });
+      expect(node.manifest_hash).toBeInstanceOf(Uint8Array);
+      expect(
+        db.scalar<number>("SELECT size FROM vfs_manifests WHERE hash = ?", node.manifest_hash),
+      ).toBe(0);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM vfs_chunks WHERE inode = ?", node.inode)).toBe(
+        0,
+      );
+    });
+  });
+
   it("atomically rejects an exclusive write when the target exists", async () => {
     await withDB(async (db) => {
       await writeFile(db, "/exclusive.txt", "first", {}, () => 1);
