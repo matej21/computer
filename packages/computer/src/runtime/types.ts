@@ -1,4 +1,11 @@
-import type { SkippedEntry } from "@cloudflare/dofs";
+import type {
+  BulkPage,
+  ReadFilesEntry,
+  ReadFilesOptions,
+  SkippedEntry,
+  WalkOptions,
+  WorkspaceWalkEntry,
+} from "@cloudflare/dofs";
 
 import type { ExecEncoding, ExecSyncResult, KillSignal } from "../shell.js";
 
@@ -35,6 +42,8 @@ export interface WorkspaceRuntimeStat {
 export interface WorkspaceRuntimeFilesystem {
   readFile(path: string): Promise<ReadableStream<Uint8Array>>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
+  walk(directory: string, options: WalkOptions): Promise<BulkPage<WorkspaceWalkEntry>>;
+  readFiles(paths: readonly string[], options: ReadFilesOptions): Promise<BulkPage<ReadFilesEntry>>;
   stat(path: string): Promise<WorkspaceRuntimeStat>;
   lstat(path: string): Promise<WorkspaceRuntimeStat>;
   readlink(path: string): Promise<string>;

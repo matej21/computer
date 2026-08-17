@@ -12,6 +12,7 @@
 // in-package tests skip the class wrapper when they only need a
 // single op.
 
+import { withDatabaseOperation } from "../operation.js";
 import type { Database } from "../storage.js";
 
 import { chmod } from "./chmod.js";
@@ -19,12 +20,21 @@ import { type FindOptions, find, type WorkspaceFoundEntry } from "./find.js";
 import { type GrepOptions, grep, type WorkspaceGrepMatch } from "./grep.js";
 import { ls } from "./ls.js";
 import { type MkdirOptions, mkdir } from "./mkdir.js";
+import type {
+  BulkPage,
+  ReadFilesEntry,
+  ReadFilesOptions,
+  WalkOptions,
+  WorkspaceWalkEntry,
+} from "./publicBulk.js";
 import { type ReaddirOptions, readdir, type WorkspaceDirentResult } from "./readdir.js";
 import { type ReadFileOptions, readFile } from "./readFile.js";
+import { readFiles } from "./readFiles.js";
 import { readlink } from "./readlink.js";
 import { type RmOptions, rm } from "./rm.js";
 import { lstat, stat, type WorkspaceStatResult } from "./stat.js";
 import { symlink } from "./symlink.js";
+import { walk } from "./walk.js";
 import { type WriteFileContent, type WriteFileOptions, writeFile } from "./writeFile.js";
 
 export interface WorkspaceFilesystemOptions {
@@ -67,6 +77,17 @@ export class WorkspaceFilesystem {
 
   async stat(path: string): Promise<WorkspaceStatResult> {
     return stat(this.db, path);
+  }
+
+  async walk(directory: string, options: WalkOptions): Promise<BulkPage<WorkspaceWalkEntry>> {
+    return withDatabaseOperation(this.db, (operationDb) => walk(operationDb, directory, options));
+  }
+
+  async readFiles(
+    paths: readonly string[],
+    options: ReadFilesOptions,
+  ): Promise<BulkPage<ReadFilesEntry>> {
+    return withDatabaseOperation(this.db, (operationDb) => readFiles(operationDb, paths, options));
   }
 
   // POSIX lstat — like stat, but doesn't follow a trailing symlink.
