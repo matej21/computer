@@ -8,7 +8,8 @@ import {
   type WalkOptions,
   type WorkspaceWalkEntry,
 } from "./publicBulk.js";
-import { resolveInode } from "./resolve.js";
+import { resolveMany } from "./resolve.js";
+import { flushWriteBatchBeforeRead } from "./writeBatch.js";
 import { iteratePendingWriteBuffers, type WriteBufferEntry } from "./writeBuffer.js";
 
 const MAX_LIMIT = 1000;
@@ -87,7 +88,8 @@ export function walk(
   const pendingQueryOffset = decoded?.mode === "merged" ? pendingOffset : 0;
   const afterKey = decoded?.mode === "flat" || decoded?.mode === "tree" ? decoded.afterKey : "";
 
-  const resolved = resolveInode(db, root);
+  flushWriteBatchBeforeRead(db);
+  const resolved = resolveMany(db, [root])[0];
   if (resolved === null) {
     throw createWorkspaceError("ENOENT", "no such path", root);
   }
