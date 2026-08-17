@@ -23,12 +23,12 @@ it("guards content deduplication against real DO SqlStorage", async () => {
     return counting.snapshot();
   });
   const storageSignature: StatementCounts = {
-    statements: 1405,
+    statements: 1305,
     reads: 302,
-    writes: 1103,
+    writes: 1003,
     other: 0,
     rowsRead: 706,
-    rowsWritten: 1610,
+    rowsWritten: 1410,
   };
   const table = [
     "DB SIZE / DEDUP GUARD",

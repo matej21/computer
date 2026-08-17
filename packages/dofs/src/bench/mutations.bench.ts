@@ -56,12 +56,12 @@ it("benchmarks filesystem mutations against real DO SqlStorage", async () => {
     },
   });
   const createBurstSignature: StatementCounts = {
-    statements: 23000,
+    statements: 22000,
     reads: 15000,
-    writes: 8000,
+    writes: 7000,
     other: 0,
     rowsRead: 19000,
-    rowsWritten: 13004,
+    rowsWritten: 11004,
   };
   results.push(createBurst);
 

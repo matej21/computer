@@ -21,7 +21,7 @@ const completeNodeSignature: StatementCounts = {
   writes: 700,
   other: 0,
   rowsRead: 700,
-  rowsWritten: 1204,
+  rowsWritten: 1104,
 };
 
 function signatureLine(label: string, signature: StatementCounts): string {

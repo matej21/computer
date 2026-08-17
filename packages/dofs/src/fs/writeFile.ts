@@ -474,9 +474,6 @@ export function linkStagedChunksSync(
   });
 }
 
-// Allocate a fresh file inode row with the supplied mode and mtime,
-// using SQLite's RETURNING so the new rowid comes back in the same
-// statement instead of through a follow-up SELECT last_insert_rowid().
 // Link a freshly created file inode into its parent directory and drop
 // any cached negative resolution for the new path. The single choke
 // point for every new-file dirent, so the resolve cache stays correct
@@ -499,16 +496,40 @@ function insertFileDirent(
   invalidateResolveExact(db, canonicalPath);
 }
 
-function insertFileNode(db: Database, mode: number, mtime: number): number {
+// Complete writes pass final metadata; paths that learn their size later use the defaults.
+function insertFileNode(
+  db: Database,
+  mode: number,
+  mtime: number,
+  rev = 0,
+  size = 0,
+  manifestHash: Uint8Array | null = null,
+): number {
   const row = db.one<{ inode: number }>(
-    "INSERT INTO vfs_nodes (type, mode, mtime, rev) VALUES ('file', ?, ?, 0) RETURNING inode",
+    "INSERT INTO vfs_nodes (type, mode, mtime, rev, size, manifest_hash) VALUES ('file', ?, ?, ?, ?, ?) RETURNING inode",
     mode,
     mtime,
+    rev,
+    size,
+    manifestHash,
   );
   if (row === undefined) {
     throw createWorkspaceError("EIO", "failed to allocate inode");
   }
   return row.inode;
+}
+
+function insertChunkRows(db: Database, inode: number, chunks: ChunkRef[]): void {
+  for (let idx = 0; idx < chunks.length; idx++) {
+    const chunk = chunks[idx];
+    db.run(
+      "INSERT INTO vfs_chunks (inode, idx, hash, size) VALUES (?, ?, ?, ?)",
+      inode,
+      idx,
+      chunk.hash,
+      chunk.size,
+    );
+  }
 }
 
 function upsertChunkBlob(db: Database, chunk: PreparedChunk, lastSeen: number): void {
@@ -1190,40 +1211,34 @@ export function writeFileSync(
 
   db.transactionSync(() => {
     const target = resolveWriteTarget(db, parts, canonical, options);
-    const inode = target.kind === "existing" ? target.inode : insertFileNode(db, mode, mtime);
     if (target.kind === "existing") {
       // Replace the existing representation. Orphaned blobs (if any)
       // are cleaned up by a later gc() pass.
-      db.run("DELETE FROM vfs_chunks WHERE inode = ?", inode);
-    } else {
-      insertFileDirent(db, target.parentInode, target.leafName, inode, target.canonicalPath);
-    }
-
-    const rev = incrementRev(db);
-    const chunks = chunksOf(bytes);
-    // Upsert blobs and write the new chunk list.
-    for (let idx = 0; idx < chunks.length; idx++) {
-      const chunk = chunks[idx];
-      upsertChunkBlob(db, chunk, mtime);
+      db.run("DELETE FROM vfs_chunks WHERE inode = ?", target.inode);
+      const rev = incrementRev(db);
+      const chunks = chunksOf(bytes);
+      for (const chunk of chunks) upsertChunkBlob(db, chunk, mtime);
+      insertChunkRows(db, target.inode, chunks);
+      const manifestHash = buildManifest(db, chunks, mtime);
       db.run(
-        "INSERT INTO vfs_chunks (inode, idx, hash, size) VALUES (?, ?, ?, ?)",
-        inode,
-        idx,
-        chunk.hash,
-        chunk.size,
+        "UPDATE vfs_nodes SET mode = ?, mtime = ?, rev = ?, size = ?, manifest_hash = ? WHERE inode = ?",
+        mode,
+        mtime,
+        rev,
+        bytes.byteLength,
+        manifestHash,
+        target.inode,
       );
+      return;
     }
 
+    const chunks = chunksOf(bytes);
+    for (const chunk of chunks) upsertChunkBlob(db, chunk, mtime);
     const manifestHash = buildManifest(db, chunks, mtime);
-    db.run(
-      "UPDATE vfs_nodes SET mode = ?, mtime = ?, rev = ?, size = ?, manifest_hash = ? WHERE inode = ?",
-      mode,
-      mtime,
-      rev,
-      bytes.byteLength,
-      manifestHash,
-      inode,
-    );
+    const rev = incrementRev(db);
+    const inode = insertFileNode(db, mode, mtime, rev, bytes.byteLength, manifestHash);
+    insertFileDirent(db, target.parentInode, target.leafName, inode, target.canonicalPath);
+    insertChunkRows(db, inode, chunks);
   });
 }
 
