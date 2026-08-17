@@ -3,7 +3,7 @@ import { z } from "zod";
 
 interface FoundEntry {
   path: string;
-  type: "file" | "dir";
+  type: "file" | "dir" | "symlink";
 }
 
 export interface FindWorkspaceLike {
@@ -35,7 +35,7 @@ const inputSchema = z.object({
 export function createFindTool(options: FindToolOptions): Tool<z.infer<typeof inputSchema>> {
   return tool({
     description:
-      "Find files and directories matching a glob. * stays within one path segment, ** crosses directories, and ? matches one character.",
+      "Find files, directories, and symlinks matching a glob. * stays within one path segment, ** crosses directories, and ? matches one character.",
     inputSchema,
     execute: async ({ path, pattern, limit, offset }) => {
       try {

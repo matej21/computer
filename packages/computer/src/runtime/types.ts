@@ -49,7 +49,10 @@ export interface WorkspaceRuntimeFilesystem {
       isSymbolicLink: boolean;
     }>
   >;
-  find(directory: string, pattern?: string): Promise<Array<{ path: string; type: "file" | "dir" }>>;
+  find(
+    directory: string,
+    pattern?: string,
+  ): Promise<Array<{ path: string; type: "file" | "dir" | "symlink" }>>;
   ls(prefix: string): Promise<string[]>;
   grep(
     pattern: string,

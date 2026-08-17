@@ -5,7 +5,7 @@ import { resolveInode } from "./resolve.js";
 
 export interface WorkspaceFoundEntry {
   path: string;
-  type: "file" | "dir";
+  type: "file" | "dir" | "symlink";
 }
 
 export interface FindOptions {
@@ -18,7 +18,7 @@ export interface FindOptions {
 interface ChildRow {
   name: string;
   child_inode: number;
-  type: "file" | "dir";
+  type: "file" | "dir" | "symlink";
 }
 
 interface WalkStart {

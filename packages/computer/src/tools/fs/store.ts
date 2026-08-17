@@ -37,7 +37,7 @@ export interface WorkspaceLike {
       directory: string,
       pattern?: string,
       options?: { limit?: number; offset?: number },
-    ): Promise<Array<{ path: string; type: "file" | "dir" }>>;
+    ): Promise<Array<{ path: string; type: "file" | "dir" | "symlink" }>>;
     grep(
       pattern: string,
       path: string,

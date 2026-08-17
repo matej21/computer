@@ -213,7 +213,7 @@ find(
     limit?: number;
     offset?: number;
   },
-): Promise<Array<{ path; type: "file" | "dir" }>>
+): Promise<Array<{ path; type: "file" | "dir" | "symlink" }>>
 ```
 
 Resolves `directory` first: throws `ENOENT` if the directory does not
@@ -223,7 +223,8 @@ its absolute path — so `**/*.ts` under `/workspace/src` matches
 `a/b.ts`, not `/workspace/src/a/b.ts`.
 
 The glob supports `*`, `**`, `**/`, and `?`. Character classes and
-brace expansions are matched literally.
+brace expansions are matched literally. Results include symlinks with
+the `"symlink"` type, but `find` does not traverse their targets.
 
 ```ts
 // Every TypeScript file in the project.
