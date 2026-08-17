@@ -126,6 +126,17 @@ export function listDirtyWriteBufferInodes(db: Database): number[] {
   return inodes;
 }
 
+export interface WriteBufferCacheEntry {
+  inode: number;
+  entry: WriteBufferEntry;
+}
+
+export function listWriteBufferEntries(db: Database): WriteBufferCacheEntry[] {
+  const cache = caches.get(databaseCoreKey(db));
+  if (cache === undefined) return [];
+  return [...cache.byInode].map(([inode, entry]) => ({ inode, entry }));
+}
+
 export function setWriteBuffer(db: Database, inode: number, entry: WriteBufferEntry): void {
   const cache = cacheFor(db);
   cache.byInode.set(inode, entry);
