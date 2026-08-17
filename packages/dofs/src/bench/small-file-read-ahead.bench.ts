@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 
 import { clearBlobCache } from "../fs/blobCache.js";
 import { readFile } from "../fs/readFile.js";
+import { resolveInode } from "../fs/resolve.js";
 import { clearResolveCache } from "../fs/resolveCache.js";
 import { withDatabaseOperation } from "../operation.js";
 import type { SQLiteWorkspaceProvider } from "../provider.js";
@@ -132,9 +133,19 @@ async function measureWideDirectoryTrigger(directoryWidth: number): Promise<Stat
     });
 
     resetReadCaches(db);
-    counting.reset();
-    await readPaths(db, paths);
-    return counting.snapshot();
+    return withDatabaseOperation(db, async (operationDb: Database) => {
+      for (const path of paths.slice(0, -1)) await readFile(operationDb, path, "utf8");
+      const triggerPath = paths.at(-1);
+      if (triggerPath === undefined || resolveInode(operationDb, triggerPath) === null) {
+        throw new Error("wide fixture trigger file is missing");
+      }
+      if (resolveInode(operationDb, directory)?.type !== "dir") {
+        throw new Error("wide fixture directory is missing");
+      }
+      counting.reset();
+      await readFile(operationDb, triggerPath, "utf8");
+      return counting.snapshot();
+    });
   });
 }
 
