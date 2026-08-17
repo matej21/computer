@@ -273,6 +273,36 @@ describe("public bounded bulk filesystem", () => {
     });
   });
 
+  it("paginates pending and committed walk entries without duplicates or gaps", async () => {
+    await withFs(async (fs) => {
+      await fs.mkdir("/tree", { recursive: true });
+      const firstName = "a".repeat(80);
+      const pendingName = "b".repeat(80);
+      const lastName = "c".repeat(80);
+      await fs.writeFile(`/tree/${firstName}`, "first");
+      await fs.writeFile(`/tree/${lastName}`, "last");
+      const provider = new SQLiteWorkspaceProvider(fs.db, { now: () => 1000 });
+      provider.openWriteBufferForCreateSync(`/tree/${pendingName}`);
+      provider.writeRangeSync(`/tree/${pendingName}`, "pending", 0);
+
+      const paths: string[] = [];
+      let cursor: string | undefined;
+      for (let pageIndex = 0; pageIndex < 5; pageIndex += 1) {
+        const page = await fs.walk("/tree", {
+          limit: 1,
+          maxBytes: 260,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        paths.push(...page.entries.map((entry) => entry.path));
+        cursor = page.cursor;
+        if (cursor === undefined) break;
+      }
+
+      expect(cursor).toBeUndefined();
+      expect(paths).toEqual([`/tree/${firstName}`, `/tree/${pendingName}`, `/tree/${lastName}`]);
+    });
+  });
+
   it("reads ordered pages with structured per-entry errors", async () => {
     await withFs(async (fs) => {
       await fs.mkdir("/dir", { recursive: true });
