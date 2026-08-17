@@ -1,76 +1,120 @@
-import type { DurableObjectStorageLike, SQLStorageLike } from "./types.js";
+import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "./types.js";
+
+type TransactionCallback = () => void;
+
+interface OperationState {
+  readonly id: number;
+  readonly maxReadCacheEntries: number;
+  readonly readCache: Map<string, unknown>;
+  generation: number;
+  closed: boolean;
+}
+
+class DatabaseCore {
+  readonly storage: DurableObjectStorageLike;
+  readonly sql: SQLStorageLike;
+  transactionDepth = 0;
+  coherenceGeneration = 0;
+  commitCallbacks: TransactionCallback[] = [];
+  rollbackCallbacks: TransactionCallback[] = [];
+  nextOperationId = 1;
+  persistentDatabase: Database | undefined;
+
+  constructor(storage: DurableObjectStorageLike) {
+    this.storage = storage;
+    this.sql = {
+      exec: <Row extends object = Record<string, unknown>>(
+        query: string,
+        ...bindings: unknown[]
+      ): SQLCursorLike<Row> => {
+        const cursor = storage.sql.exec<Row>(query, ...bindings);
+        if (statementWrites(query)) this.coherenceGeneration += 1;
+        return cursor;
+      },
+    };
+  }
+
+  createOperation(maxReadCacheEntries: number): OperationState {
+    return {
+      id: this.nextOperationId++,
+      maxReadCacheEntries,
+      readCache: new Map(),
+      generation: this.coherenceGeneration,
+      closed: false,
+    };
+  }
+}
+
+// Views over one storage share transaction and coherence ownership.
+const cores = new WeakMap<DurableObjectStorageLike, DatabaseCore>();
+const databaseCores = new WeakMap<Database, DatabaseCore>();
+const operations = new WeakMap<Database, OperationState>();
+
+function coreForStorage(storage: DurableObjectStorageLike): DatabaseCore {
+  let core = cores.get(storage);
+  if (core === undefined) {
+    core = new DatabaseCore(storage);
+    cores.set(storage, core);
+  }
+  return core;
+}
+
+function coreForDatabase(db: Database): DatabaseCore {
+  const core = databaseCores.get(db);
+  if (core === undefined) throw new Error("Database core is unavailable");
+  return core;
+}
+
+function assertOpen(db: Database): void {
+  if (operations.get(db)?.closed === true) {
+    throw new Error("Database operation is closed");
+  }
+}
+
+function runCallbacks(callbacks: TransactionCallback[]): unknown[] {
+  const errors: unknown[] = [];
+  for (const callback of callbacks) {
+    try {
+      callback();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
+function throwCallbackErrors(errors: unknown[]): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, "Database commit callbacks failed");
+}
 
 export class Database {
   readonly sql: SQLStorageLike;
   readonly transactionSync: <T>(closure: () => T) => T;
-  // Depth counter so reentrant transactionSync() calls work. The
-  // outer call uses the storage adapter's transactionSync (or
-  // BEGIN/COMMIT under the hood); nested calls use SAVEPOINTs
-  // through sql.exec directly. SQLite forbids a real BEGIN inside
-  // an active transaction.
-  #txDepth = 0;
 
   constructor(storage: DurableObjectStorageLike) {
-    this.sql = storage.sql;
+    const core = coreForStorage(storage);
+    databaseCores.set(this, core);
+    core.persistentDatabase ??= this;
+    this.sql = {
+      exec: <Row extends object = Record<string, unknown>>(
+        query: string,
+        ...bindings: unknown[]
+      ): SQLCursorLike<Row> => {
+        assertOpen(this);
+        return core.sql.exec<Row>(query, ...bindings);
+      },
+    };
     this.transactionSync = <T>(closure: () => T): T => {
-      if (this.#txDepth > 0) {
-        // Reentrant call: use a savepoint. SQLite's RELEASE on a
-        // savepoint inside an outer transaction commits the inner
-        // work without ending the outer one.
-        const sp = `_t${this.#txDepth}`;
-        this.sql.exec(`SAVEPOINT ${sp}`);
-        this.#txDepth++;
-        try {
-          const result = closure();
-          this.sql.exec(`RELEASE ${sp}`);
-          return result;
-        } catch (error) {
-          this.sql.exec(`ROLLBACK TO ${sp}`);
-          this.sql.exec(`RELEASE ${sp}`);
-          throw error;
-        } finally {
-          this.#txDepth--;
-        }
-      }
-      // Outer call: hand off to the storage adapter so the DO
-      // runtime's transaction semantics apply.
-      this.#txDepth++;
-      try {
-        if (storage.transactionSync !== undefined) {
-          return storage.transactionSync(closure);
-        }
-        if (storage.transaction !== undefined) {
-          const result = storage.transaction(closure);
-          if (
-            result !== undefined &&
-            result !== null &&
-            typeof result === "object" &&
-            "then" in result
-          ) {
-            throw new Error("Durable Object storage adapter requires synchronous transactions");
-          }
-          return result;
-        }
-        return closure();
-      } finally {
-        this.#txDepth--;
-      }
+      assertOpen(this);
+      return transact(core, closure);
     };
   }
 
-  // True while a transactionSync closure is on the stack. The resolve
-  // cache uses this to refuse populating entries mid-transaction, so a
-  // rolled-back mutation can never leave the cache reflecting
-  // uncommitted state. (Invalidation still runs freely inside a
-  // transaction — dropping an entry is always safe.)
-  //
-  // Invariant: #txDepth only tracks transactionSync. A raw
-  // BEGIN/SAVEPOINT issued through run() would open a transaction this
-  // flag can't see, letting the cache populate mid-transaction and
-  // survive a rollback — so transactionSync is the only sanctioned way
-  // to open one.
   get inTransaction(): boolean {
-    return this.#txDepth > 0;
+    assertOpen(this);
+    return coreForDatabase(this).transactionDepth > 0;
   }
 
   run(query: string, ...bindings: unknown[]): void {
@@ -88,24 +132,272 @@ export class Database {
 
   scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
     const row = this.one<Record<string, T>>(query, ...bindings);
-    if (row === undefined) {
-      return undefined;
-    }
-
+    if (row === undefined) return undefined;
     const [value] = Object.values(row);
     return value;
   }
 }
 
-// Cloudflare's DO SqlStorage returns BLOB columns as ArrayBuffer,
-// whereas node:sqlite returns Uint8Array. Normalise to Uint8Array so
-// the rest of the code only has to handle one shape.
+function transact<T>(core: DatabaseCore, closure: () => T): T {
+  if (core.transactionDepth > 0) return transactNested(core, closure);
+
+  core.transactionDepth = 1;
+  core.commitCallbacks = [];
+  core.rollbackCallbacks = [];
+  let result: T;
+  try {
+    if (core.storage.transactionSync !== undefined) {
+      result = core.storage.transactionSync(closure);
+    } else if (core.storage.transaction !== undefined) {
+      const transactionResult = core.storage.transaction(closure);
+      if (
+        transactionResult !== undefined &&
+        transactionResult !== null &&
+        typeof transactionResult === "object" &&
+        "then" in transactionResult
+      ) {
+        throw new Error("Durable Object storage adapter requires synchronous transactions");
+      }
+      result = transactionResult;
+    } else {
+      result = closure();
+    }
+  } catch (error) {
+    core.transactionDepth = 0;
+    const callbacks = core.rollbackCallbacks;
+    core.commitCallbacks = [];
+    core.rollbackCallbacks = [];
+    runCallbacks(callbacks);
+    throw error;
+  }
+
+  core.transactionDepth = 0;
+  const callbacks = core.commitCallbacks;
+  core.commitCallbacks = [];
+  core.rollbackCallbacks = [];
+  throwCallbackErrors(runCallbacks(callbacks));
+  return result;
+}
+
+function transactNested<T>(core: DatabaseCore, closure: () => T): T {
+  const savepoint = `_t${core.transactionDepth}`;
+  const commitLength = core.commitCallbacks.length;
+  const rollbackLength = core.rollbackCallbacks.length;
+  core.sql.exec(`SAVEPOINT ${savepoint}`);
+  core.transactionDepth += 1;
+  try {
+    const result = closure();
+    core.sql.exec(`RELEASE ${savepoint}`);
+    return result;
+  } catch (error) {
+    core.commitCallbacks.length = commitLength;
+    core.rollbackCallbacks.length = rollbackLength;
+    try {
+      core.sql.exec(`ROLLBACK TO ${savepoint}`);
+    } catch {
+      // Preserve the original nested failure.
+    }
+    try {
+      core.sql.exec(`RELEASE ${savepoint}`);
+    } catch {
+      // Preserve the original nested failure.
+    }
+    throw error;
+  } finally {
+    core.transactionDepth -= 1;
+  }
+}
+
+export function createDatabaseOperationView(db: Database, maxReadCacheEntries: number): Database {
+  assertOpen(db);
+  const core = coreForDatabase(db);
+  const view = new Database(core.storage);
+  operations.set(view, core.createOperation(maxReadCacheEntries));
+  return view;
+}
+
+export function isDatabaseOperationView(db: Database): boolean {
+  assertOpen(db);
+  return operations.has(db);
+}
+
+export function closeDatabaseOperationView(db: Database): void {
+  const operation = operations.get(db);
+  if (operation === undefined || operation.closed) return;
+  operation.closed = true;
+  operation.readCache.clear();
+}
+
+export function databaseCoherenceGeneration(db: Database): number {
+  assertOpen(db);
+  return coreForDatabase(db).coherenceGeneration;
+}
+
+export function databaseCoreKey(db: Database): object {
+  assertOpen(db);
+  return coreForDatabase(db);
+}
+
+export function assertDatabaseOpen(db: Database): void {
+  assertOpen(db);
+}
+
+// Deferred cleanup may resolve the persistent view after an operation closes.
+export function persistentDatabaseView(db: Database): Database {
+  const persistent = coreForDatabase(db).persistentDatabase;
+  if (persistent === undefined) throw new Error("Persistent database view is unavailable");
+  return persistent;
+}
+
+export function lookupDatabaseOperationRead(db: Database, key: string): unknown {
+  assertOpen(db);
+  const operation = operations.get(db);
+  if (operation === undefined || db.inTransaction) return undefined;
+  const core = coreForDatabase(db);
+  if (operation.generation !== core.coherenceGeneration) {
+    operation.readCache.clear();
+    operation.generation = core.coherenceGeneration;
+    return undefined;
+  }
+  const value = operation.readCache.get(key);
+  if (value === undefined) return undefined;
+  operation.readCache.delete(key);
+  operation.readCache.set(key, value);
+  return value;
+}
+
+export function storeDatabaseOperationRead(db: Database, key: string, value: unknown): void {
+  assertOpen(db);
+  const operation = operations.get(db);
+  if (operation === undefined || db.inTransaction || operation.maxReadCacheEntries === 0) return;
+  const core = coreForDatabase(db);
+  if (operation.generation !== core.coherenceGeneration) {
+    operation.readCache.clear();
+    operation.generation = core.coherenceGeneration;
+  }
+  operation.readCache.delete(key);
+  operation.readCache.set(key, value);
+  while (operation.readCache.size > operation.maxReadCacheEntries) {
+    const oldest = operation.readCache.keys().next();
+    if (oldest.done) break;
+    operation.readCache.delete(oldest.value);
+  }
+}
+
+export function clearDatabaseOperationReadCache(db: Database): void {
+  assertOpen(db);
+  const operation = operations.get(db);
+  if (operation === undefined) return;
+  operation.readCache.clear();
+  operation.generation = coreForDatabase(db).coherenceGeneration;
+}
+
+export function registerAfterOutermostCommit(db: Database, callback: TransactionCallback): void {
+  assertOpen(db);
+  const core = coreForDatabase(db);
+  if (core.transactionDepth === 0) throw new Error("No active database transaction");
+  core.commitCallbacks.push(callback);
+}
+
+export function registerAfterOutermostRollback(db: Database, callback: TransactionCallback): void {
+  assertOpen(db);
+  const core = coreForDatabase(db);
+  if (core.transactionDepth === 0) throw new Error("No active database transaction");
+  core.rollbackCallbacks.push(callback);
+}
+
+function statementWrites(query: string): boolean {
+  const first = firstTopLevelKeyword(query);
+  return (
+    first !== "SELECT" &&
+    first !== "SAVEPOINT" &&
+    first !== "RELEASE" &&
+    first !== "ROLLBACK" &&
+    first !== "BEGIN" &&
+    first !== "COMMIT" &&
+    first !== "END"
+  );
+}
+
+function firstTopLevelKeyword(query: string): string | undefined {
+  let depth = 0;
+  let quote: "'" | '"' | "`" | "]" | undefined;
+  let lineComment = false;
+  let blockComment = false;
+  let sawWith = false;
+
+  for (let index = 0; index < query.length; index += 1) {
+    const char = query[index];
+    const next = query[index + 1];
+    if (lineComment) {
+      if (char === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote !== undefined) {
+      if (char === quote || (quote === "]" && char === "]")) {
+        if (next === char && quote !== "]") index += 1;
+        else quote = undefined;
+      }
+      continue;
+    }
+    if (char === "-" && next === "-") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+      continue;
+    }
+    if (char === "[") {
+      quote = "]";
+      continue;
+    }
+    if (char === "(") {
+      depth += 1;
+      continue;
+    }
+    if (char === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth !== 0 || !/[A-Za-z]/.test(char)) continue;
+
+    let end = index + 1;
+    while (end < query.length && /[A-Za-z]/.test(query[end])) end += 1;
+    const keyword = query.slice(index, end).toUpperCase();
+    index = end - 1;
+    if (!sawWith) {
+      if (keyword !== "WITH") return keyword;
+      sawWith = true;
+      continue;
+    }
+    if (
+      keyword === "SELECT" ||
+      keyword === "INSERT" ||
+      keyword === "UPDATE" ||
+      keyword === "DELETE" ||
+      keyword === "REPLACE"
+    ) {
+      return keyword;
+    }
+  }
+  return undefined;
+}
+
 function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
-  // node:sqlite hands back rows with a null prototype; the DO SQL
-  // flavour returns ArrayBuffer for BLOB columns. Re-key into a plain
-  // {} so consumers get Object.prototype-shaped rows (capnweb's
-  // serializer keys off Object.prototype to detect "object") and
-  // convert any ArrayBuffer to Uint8Array in the same pass.
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(row)) {
     const value = row[key];

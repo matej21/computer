@@ -7,10 +7,10 @@
 // and evicts the entry, so per-syscall writes no longer accumulate
 // orphan blob rows in the store.
 //
-// The cache is keyed by Database so a fresh database (a test, a
-// rebooted DO incarnation) starts with an empty cache.
+// The cache is keyed by the shared database core so root and operation
+// views observe the same live buffers.
 
-import type { Database } from "../storage.js";
+import { type Database, databaseCoreKey, persistentDatabaseView } from "../storage.js";
 
 export interface WriteBufferEntry {
   // Growable backing store. byteLength is capacity; logical length
@@ -57,10 +57,11 @@ interface DatabaseCache {
   nextPendingInode: number;
 }
 
-const caches = new WeakMap<Database, DatabaseCache>();
+const caches = new WeakMap<object, DatabaseCache>();
 
 function cacheFor(db: Database): DatabaseCache {
-  let cache = caches.get(db);
+  const key = databaseCoreKey(db);
+  let cache = caches.get(key);
   if (cache === undefined) {
     cache = {
       byInode: new Map(),
@@ -68,20 +69,20 @@ function cacheFor(db: Database): DatabaseCache {
       byPendingParent: new Map(),
       nextPendingInode: -1,
     };
-    caches.set(db, cache);
+    caches.set(key, cache);
   }
   return cache;
 }
 
 export function getWriteBuffer(db: Database, inode: number): WriteBufferEntry | undefined {
-  return caches.get(db)?.byInode.get(inode);
+  return caches.get(databaseCoreKey(db))?.byInode.get(inode);
 }
 
 export function getPendingWriteBufferByPath(
   db: Database,
   canonicalPath: string,
 ): WriteBufferEntry | undefined {
-  return caches.get(db)?.byPendingPath.get(canonicalPath);
+  return caches.get(databaseCoreKey(db))?.byPendingPath.get(canonicalPath);
 }
 
 function pendingParentKey(parentInode: number, leafName: string): string {
@@ -93,11 +94,13 @@ export function getPendingWriteBufferByParent(
   parentInode: number,
   leafName: string,
 ): WriteBufferEntry | undefined {
-  return caches.get(db)?.byPendingParent.get(pendingParentKey(parentInode, leafName));
+  return caches
+    .get(databaseCoreKey(db))
+    ?.byPendingParent.get(pendingParentKey(parentInode, leafName));
 }
 
 export function hasPendingWriteBuffers(db: Database): boolean {
-  return (caches.get(db)?.byPendingParent.size ?? 0) > 0;
+  return (caches.get(databaseCoreKey(db))?.byPendingParent.size ?? 0) > 0;
 }
 
 // List pending-create buffers whose parent dirent matches `parentInode`.
@@ -108,7 +111,7 @@ export function listPendingByParent(db: Database, parentInode: number): WriteBuf
 }
 
 export function listPendingWriteBuffers(db: Database): WriteBufferEntry[] {
-  const cache = caches.get(db);
+  const cache = caches.get(databaseCoreKey(db));
   if (cache === undefined) return [];
   return [...cache.byInode.values()].filter((entry) => entry.pending !== undefined);
 }
@@ -127,7 +130,7 @@ export function setWriteBuffer(db: Database, inode: number, entry: WriteBufferEn
 }
 
 export function deleteWriteBuffer(db: Database, inode: number): void {
-  const cache = caches.get(db);
+  const cache = caches.get(databaseCoreKey(persistentDatabaseView(db)));
   if (cache === undefined) return;
   const entry = cache.byInode.get(inode);
   if (entry?.pending !== undefined) {
@@ -154,7 +157,7 @@ export function allocatePendingInode(db: Database): number {
 // Re-key a pending entry to the real inode assigned by SQLite at
 // commit time, dropping the pending-path index.
 export function promotePendingToInode(db: Database, pendingInode: number, realInode: number): void {
-  const cache = caches.get(db);
+  const cache = caches.get(databaseCoreKey(db));
   if (cache === undefined) return;
   const entry = cache.byInode.get(pendingInode);
   if (entry === undefined) return;

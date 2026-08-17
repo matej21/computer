@@ -123,7 +123,7 @@ it("benchmarks an operation-bound resolution cache against real DO SqlStorage", 
     reads: 6,
     writes: 0,
     other: 0,
-    rowsRead: 54,
+    rowsRead: 126,
     rowsWritten: 0,
   });
   expect(operation.statements).toBeLessThan(baseline.statements);

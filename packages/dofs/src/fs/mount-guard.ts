@@ -9,35 +9,36 @@
 //
 // The set of read-only roots is small (one row per registered
 // mount per workspace, typically <10) and changes only at indexer
-// write time. Cache it per Database in a WeakMap so repeat lookups
-// don't hit SQLite. The mount indexer in @cloudflare/computer
+// write time. Cache it per database core in a WeakMap so root and
+// operation views share it without repeat lookups. The mount indexer
+// in @cloudflare/computer
 // invalidates the cache via `invalidateReadOnlyMountCache(db)` after
 // it writes _vfs_mounts.
 
 import { createWorkspaceError } from "../errors.js";
-import type { Database } from "../storage.js";
+import { type Database, databaseCoreKey } from "../storage.js";
 
 // undefined sentinel = "not loaded yet"; an empty array means
 // "loaded, no read-only mounts registered". The two are not the
 // same: the empty case must skip the SQL lookup on every check.
-const cache = new WeakMap<Database, readonly string[]>();
+const cache = new WeakMap<object, readonly string[]>();
 
 // Public so the workspace-side indexer can drop the cache after it
 // writes a new _vfs_mounts row. Tests also call it when they stage
 // a mount fixture by direct SQL.
 export function invalidateReadOnlyMountCache(db: Database): void {
-  cache.delete(db);
+  cache.delete(databaseCoreKey(db));
 }
 
 function loadReadOnlyRoots(db: Database): readonly string[] {
   const rows = db.all<{ root: string }>("SELECT root FROM _vfs_mounts WHERE mode = 'read-only'");
   const roots = rows.map((r) => r.root);
-  cache.set(db, roots);
+  cache.set(databaseCoreKey(db), roots);
   return roots;
 }
 
 export function getReadOnlyMountRoots(db: Database): readonly string[] {
-  const cached = cache.get(db);
+  const cached = cache.get(databaseCoreKey(db));
   if (cached !== undefined) return cached;
   return loadReadOnlyRoots(db);
 }

@@ -44,7 +44,7 @@ import {
 } from "./fs/writeFile.js";
 import { canonicalizePath } from "./path.js";
 import { incrementRev } from "./rev.js";
-import type { Database } from "./storage.js";
+import { assertDatabaseOpen, type Database, persistentDatabaseView } from "./storage.js";
 
 export interface SQLiteWorkspaceProviderOptions {
   // Wall-clock source. Defaults to Date.now so production callers
@@ -107,6 +107,21 @@ interface FdState {
   append: boolean;
 }
 
+interface ProviderState {
+  readonly fds: Map<number, FdState>;
+  readonly persistentDb: Database;
+  nextFd: number;
+}
+
+const providerStates = new WeakMap<SQLiteWorkspaceProvider, ProviderState>();
+
+function providerState(provider: SQLiteWorkspaceProvider): ProviderState {
+  assertDatabaseOpen(provider.db);
+  const state = providerStates.get(provider);
+  if (state === undefined) throw new Error("SQLiteWorkspaceProvider state is unavailable");
+  return state;
+}
+
 export class SQLiteWorkspaceProvider {
   readonly db: Database;
   readonly now: () => number;
@@ -116,18 +131,23 @@ export class SQLiteWorkspaceProvider {
   readonly supportsSymlinks = true;
   readonly supportsWatch = true;
 
-  // Fd table. Start at 3 — 0/1/2 are reserved by convention even
-  // though we don't expose them — so consumers that pass them around
-  // can't accidentally collide with stdio mental models.
-  #fds = new Map<number, FdState>();
-  #nextFd = 3;
-
   readonly watchIntervalMs: number;
 
   constructor(db: Database, options: SQLiteWorkspaceProviderOptions = {}) {
+    assertDatabaseOpen(db);
     this.db = db;
     this.now = options.now ?? Date.now;
     this.watchIntervalMs = options.watchIntervalMs ?? 100;
+    // Start at 3 so descriptors cannot collide with stdio conventions.
+    providerStates.set(this, {
+      fds: new Map(),
+      persistentDb: persistentDatabaseView(db),
+      nextFd: 3,
+    });
+  }
+
+  #assertOpen(): void {
+    assertDatabaseOpen(this.db);
   }
 
   // -- Essential primitives ------------------------------------------
@@ -137,6 +157,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   openSync(path: string, flags: string = "r", _mode?: number): number {
+    this.#assertOpen();
     const { read, write, truncate, append, create, exclusive } = parseFlags(flags);
     const existing = resolveInode(this.db, path);
 
@@ -158,8 +179,9 @@ export class SQLiteWorkspaceProvider {
     }
 
     const stat = statImpl(this.db, path);
-    const fd = this.#nextFd++;
-    this.#fds.set(fd, {
+    const state = providerState(this);
+    const fd = state.nextFd++;
+    state.fds.set(fd, {
       path,
       position: append ? stat.size : 0,
       readable: read,
@@ -174,10 +196,15 @@ export class SQLiteWorkspaceProvider {
   }
 
   statSync(path: string, _options?: { bigint?: boolean }): VirtualStatsLike {
+    this.#assertOpen();
+    return this.#statSync(this.db, path);
+  }
+
+  #statSync(db: Database, path: string): VirtualStatsLike {
     // statImpl resolves the path once (following symlinks) and returns
     // the inode, so nlink comes from the same walk. A pending-create
     // file reports inode 0, which yields nlink 1.
-    const s = statImpl(this.db, path);
+    const s = statImpl(db, path);
     return wrapStats({
       mode: s.mode,
       size: s.size,
@@ -186,7 +213,7 @@ export class SQLiteWorkspaceProvider {
       isFile: s.isFile,
       isDirectory: s.isDirectory,
       isSymbolicLink: false,
-      nlink: linkCount(this.db, s.inode),
+      nlink: linkCount(db, s.inode),
     });
   }
 
@@ -195,6 +222,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   lstatSync(path: string, _options?: { bigint?: boolean }): VirtualStatsLike {
+    this.#assertOpen();
     const pending = findPendingWriteBuffer(this.db, path);
     if (pending !== undefined && pending.pending !== undefined) {
       return wrapStats({
@@ -238,6 +266,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   readdirSync(path: string, options?: { withFileTypes?: boolean }): string[] | VirtualDirentLike[] {
+    this.#assertOpen();
     const entries = readdirImpl(this.db, path);
     if (options?.withFileTypes === true) {
       return entries.map((entry) => wrapDirent(entry));
@@ -250,6 +279,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   mkdirSync(path: string, options?: MkdirOptions): string | undefined {
+    this.#assertOpen();
     mkdirImpl(this.db, path, options ?? {}, this.now);
     return undefined;
   }
@@ -260,6 +290,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   rmdirSync(path: string): void {
+    this.#assertOpen();
     flushPendingUnderNode(this.db, path, this.now);
     rmImpl(this.db, path, {});
   }
@@ -270,6 +301,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   unlinkSync(path: string): void {
+    this.#assertOpen();
     // If a buffered create is still pending for this path, commit
     // it first so rm sees a real inode to unlink (and so the
     // resulting GC sees the orphaned blob, matching the non-buffered
@@ -300,6 +332,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   linkSync(existingPath: string, newPath: string): void {
+    this.#assertOpen();
     // Commit a still-pending source before adding the second dirent,
     // otherwise link has nothing real to point at. Also commit a
     // still-pending destination: link's existence check looks at
@@ -318,6 +351,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   renameSync(oldPath: string, newPath: string): void {
+    this.#assertOpen();
     // Commit any still-pending creates at either end before the rename
     // touches dirents: the source needs a real inode to move, and a
     // pending buffer at the destination would otherwise slip past
@@ -356,6 +390,7 @@ export class SQLiteWorkspaceProvider {
     path: string,
     options?: BufferEncoding | { encoding?: BufferEncoding | null } | null,
   ): Buffer | string {
+    this.#assertOpen();
     const encoding = typeof options === "string" ? options : options?.encoding;
     const pending = findPendingWriteBuffer(this.db, path);
     if (pending !== undefined) {
@@ -411,6 +446,7 @@ export class SQLiteWorkspaceProvider {
     data: string | Buffer,
     options?: { encoding?: BufferEncoding; mode?: number } | BufferEncoding,
   ): void {
+    this.#assertOpen();
     const mode = typeof options === "string" ? undefined : options?.mode;
     const bytes =
       typeof data === "string"
@@ -425,6 +461,7 @@ export class SQLiteWorkspaceProvider {
     ranges: WriteFileRange[],
     options?: { encoding?: BufferEncoding; mode?: number } | BufferEncoding,
   ): void {
+    this.#assertOpen();
     const mode = typeof options === "string" ? undefined : options?.mode;
     const bytes =
       typeof data === "string"
@@ -434,6 +471,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   createFileSync(path: string, options?: { mode?: number }): void {
+    this.#assertOpen();
     createFileSyncImpl(this.db, path, { mode: options?.mode }, this.now);
   }
 
@@ -443,6 +481,7 @@ export class SQLiteWorkspaceProvider {
     offset: number,
     options?: { encoding?: BufferEncoding; mode?: number } | BufferEncoding,
   ): number {
+    this.#assertOpen();
     const mode = typeof options === "string" ? undefined : options?.mode;
     const bytes =
       typeof data === "string"
@@ -452,22 +491,27 @@ export class SQLiteWorkspaceProvider {
   }
 
   truncateFileSync(path: string, len: number): void {
+    this.#assertOpen();
     truncateFileSyncImpl(this.db, path, len, this.now);
   }
 
   openWriteBufferSync(path: string): void {
+    this.#assertOpen();
     openWriteBufferSyncImpl(this.db, path);
   }
 
   openWriteBufferForCreateSync(path: string, options?: { mode?: number }): void {
+    this.#assertOpen();
     openWriteBufferForCreateSyncImpl(this.db, path, { mode: options?.mode }, this.now);
   }
 
   releaseWriteBufferSync(path: string): void {
+    this.#assertOpen();
     releaseWriteBufferSyncImpl(this.db, path, this.now);
   }
 
   chmodSync(path: string, mode: number): void {
+    this.#assertOpen();
     const pending = findPendingWriteBuffer(this.db, path);
     if (pending !== undefined) {
       // Pending-create files don't have a row yet; stash the mode on
@@ -493,6 +537,7 @@ export class SQLiteWorkspaceProvider {
     _data: string | Buffer,
     _options?: { encoding?: BufferEncoding; mode?: number } | BufferEncoding,
   ): Promise<void> {
+    this.#assertOpen();
     return Promise.reject(notImplemented("appendFile"));
   }
 
@@ -501,6 +546,7 @@ export class SQLiteWorkspaceProvider {
     _data: string | Buffer,
     _options?: { encoding?: BufferEncoding; mode?: number } | BufferEncoding,
   ): void {
+    this.#assertOpen();
     throw notImplemented("appendFileSync");
   }
 
@@ -509,6 +555,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   existsSync(path: string): boolean {
+    this.#assertOpen();
     try {
       if (findPendingWriteBuffer(this.db, path) !== undefined) return true;
       return resolveInode(this.db, path) !== null;
@@ -518,14 +565,17 @@ export class SQLiteWorkspaceProvider {
   }
 
   copyFile(_src: string, _dest: string, _mode?: number): Promise<void> {
+    this.#assertOpen();
     return Promise.reject(notImplemented("copyFile"));
   }
 
   copyFileSync(_src: string, _dest: string, _mode?: number): void {
+    this.#assertOpen();
     throw notImplemented("copyFileSync");
   }
 
   internalModuleStat(_path: string): number {
+    this.#assertOpen();
     // Used by node:vfs module-resolution hooks. The computerd driver doesn't
     // need it; if this provider is ever mounted via `vfs.mount()` we'll
     // need to return 0 for files, 1 for dirs, -1 for not-found.
@@ -537,6 +587,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   realpathSync(path: string, _options?: { encoding?: BufferEncoding }): string {
+    this.#assertOpen();
     const { path: canonical } = canonicalizePath(path);
     if (resolveInode(this.db, canonical) === null) {
       throw createWorkspaceError("ENOENT", `no such path: ${canonical}`, canonical);
@@ -550,6 +601,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   accessSync(path: string, _mode?: number): void {
+    this.#assertOpen();
     if (resolveInode(this.db, path) === null) {
       throw createWorkspaceError("ENOENT", `no such path: ${path}`, path);
     }
@@ -558,7 +610,8 @@ export class SQLiteWorkspaceProvider {
   // -- File descriptors ----------------------------------------------
 
   closeSync(fd: number): void {
-    if (!this.#fds.delete(fd)) {
+    this.#assertOpen();
+    if (!providerState(this).fds.delete(fd)) {
       throw createWorkspaceError("EBADF", `unknown fd ${fd}`);
     }
   }
@@ -570,12 +623,13 @@ export class SQLiteWorkspaceProvider {
     length: number,
     position: number | null,
   ): number {
+    this.#assertOpen();
     const state = this.#fdOrThrow(fd);
     if (!state.readable) {
       throw createWorkspaceError("EBADF", `fd ${fd} is not readable`);
     }
     const startAt = position ?? state.position;
-    const slice = readRangeSyncImpl(this.db, state.path, startAt, length);
+    const slice = readRangeSyncImpl(providerState(this).persistentDb, state.path, startAt, length);
     const view =
       buffer instanceof Buffer
         ? buffer
@@ -588,6 +642,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   readRangeSync(path: string, offset: number, length: number): Buffer {
+    this.#assertOpen();
     const slice = readRangeSyncImpl(this.db, path, offset, length);
     return Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
   }
@@ -599,6 +654,7 @@ export class SQLiteWorkspaceProvider {
     length: number = buffer.byteLength - offset,
     position: number | null = null,
   ): number {
+    this.#assertOpen();
     const state = this.#fdOrThrow(fd);
     if (!state.writable) {
       throw createWorkspaceError("EBADF", `fd ${fd} is not writable`);
@@ -608,11 +664,12 @@ export class SQLiteWorkspaceProvider {
     // path and raises ENOENT/EISDIR. A zero-length write short-circuits
     // before that resolve, so keep an explicit existence check for it.
     let startAt: number;
+    const persistentDb = providerState(this).persistentDb;
     if (state.append) {
-      startAt = this.statSync(state.path).size;
+      startAt = this.#statSync(persistentDb, state.path).size;
     } else {
       if (length === 0) {
-        this.statSync(state.path);
+        this.#statSync(persistentDb, state.path);
       }
       startAt = position ?? state.position;
     }
@@ -620,7 +677,7 @@ export class SQLiteWorkspaceProvider {
       buffer instanceof Buffer
         ? new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length)
         : new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length);
-    writeRangeSyncImpl(this.db, state.path, view, startAt, {}, this.now);
+    writeRangeSyncImpl(persistentDb, state.path, view, startAt, {}, this.now);
     if (position === null || position === undefined) {
       state.position = startAt + length;
     }
@@ -628,28 +685,35 @@ export class SQLiteWorkspaceProvider {
   }
 
   fstatSync(fd: number, _options?: { bigint?: boolean }): VirtualStatsLike {
+    this.#assertOpen();
     const state = this.#fdOrThrow(fd);
-    return this.statSync(state.path);
+    return this.#statSync(providerState(this).persistentDb, state.path);
   }
 
   truncateSync(path: string, len: number): void {
-    const node = resolveInode(this.db, path);
+    this.#assertOpen();
+    this.#truncateSync(this.db, path, len);
+  }
+
+  #truncateSync(db: Database, path: string, len: number): void {
+    const node = resolveInode(db, path);
     if (node === null) {
       throw createWorkspaceError("ENOENT", `no such path: ${path}`, path);
     }
     if (node.type !== "file") {
       throw createWorkspaceError("EISDIR", `path is a directory: ${path}`, path);
     }
-    truncateFileSyncImpl(this.db, path, len, this.now);
+    truncateFileSyncImpl(db, path, len, this.now);
   }
 
   ftruncateSync(fd: number, len: number): void {
+    this.#assertOpen();
     const state = this.#fdOrThrow(fd);
-    this.truncateSync(state.path, len);
+    this.#truncateSync(providerState(this).persistentDb, state.path, len);
   }
 
   #fdOrThrow(fd: number): FdState {
-    const state = this.#fds.get(fd);
+    const state = providerState(this).fds.get(fd);
     if (state === undefined) {
       throw createWorkspaceError("EBADF", `unknown fd ${fd}`);
     }
@@ -663,6 +727,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   readlinkSync(path: string, _options?: { encoding?: BufferEncoding }): string {
+    this.#assertOpen();
     return readlinkImpl(this.db, path);
   }
 
@@ -672,6 +737,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   symlinkSync(target: string, path: string, _type?: string): void {
+    this.#assertOpen();
     symlinkImpl(this.db, target, path, this.now);
   }
 
@@ -693,7 +759,8 @@ export class SQLiteWorkspaceProvider {
   // semantics can stat the path themselves.
 
   watch(path: string, options: WatchOptions = {}): WatchHandle {
-    return createWatcher(this.db, path, options, this.watchIntervalMs);
+    this.#assertOpen();
+    return createWatcher(providerState(this).persistentDb, path, options, this.watchIntervalMs);
   }
 
   watchAsync(path: string, options: WatchOptions = {}): AsyncIterable<WatchEvent> {
@@ -709,6 +776,7 @@ export class SQLiteWorkspaceProvider {
     _options?: unknown,
     _listener?: (curr: VirtualStatsLike, prev: VirtualStatsLike) => void,
   ): unknown {
+    this.#assertOpen();
     throw notImplemented("watchFile");
   }
 
@@ -716,8 +784,21 @@ export class SQLiteWorkspaceProvider {
     _path: string,
     _listener?: (curr: VirtualStatsLike, prev: VirtualStatsLike) => void,
   ): void {
+    this.#assertOpen();
     throw notImplemented("unwatchFile");
   }
+}
+
+export function createProviderOperationView(
+  provider: SQLiteWorkspaceProvider,
+  db: Database,
+): SQLiteWorkspaceProvider {
+  const view = new SQLiteWorkspaceProvider(db, {
+    now: provider.now,
+    watchIntervalMs: provider.watchIntervalMs,
+  });
+  providerStates.set(view, providerState(provider));
+  return view;
 }
 
 function notImplemented(method: string) {
