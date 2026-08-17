@@ -43,12 +43,12 @@ it("benchmarks sequential creates against a synchronous write batch", async () =
   const baseline = await baselineBenchmark();
   console.log(`WRITE_BATCH_BASELINE ${JSON.stringify(baseline)}`);
   expectMetricSignature("sequential create baseline", baseline, {
-    statements: 5500,
+    statements: 5000,
     reads: 1500,
-    writes: 4000,
+    writes: 3500,
     other: 0,
     rowsRead: 3500,
-    rowsWritten: 8500,
+    rowsWritten: 7500,
   });
 
   const { withWriteBatchSync } = await import("../fs/writeBatch.js");
