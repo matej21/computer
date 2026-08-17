@@ -1,8 +1,8 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 
-// Benchmark runner. Reuses the workerd-backed pool (same wrangler
-// config as the workers test project) so the harness drives a REAL
+// Benchmark runner. Reuses the workerd-backed pool and workers test
+// config so the harness drives a REAL
 // Durable Object SqlStorage — NOT the node SQLiteTestStorage fixture,
 // which caches prepared statements and would understate per-statement
 // cost. Scoped to the *.bench.ts glob so it never runs during
@@ -15,6 +15,7 @@ export default defineConfig({
   ],
   test: {
     globals: true,
+    fileParallelism: false,
     include: ["src/bench/**/*.bench.ts"],
     // The harness builds large trees and loops tens of thousands of
     // synchronous ops; the default 5s timeout is far too tight.
