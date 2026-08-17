@@ -5,7 +5,12 @@ import { clearResolveCache } from "./fs/resolveCache.js";
 import { withDB } from "./fs/with-db.js";
 import { writeFileSync } from "./fs/writeFile.js";
 import type * as publicApi from "./index.js";
-import { withDatabaseOperation, withProviderOperation } from "./operation.js";
+import {
+  afterOutermostCommit,
+  afterOutermostRollback,
+  withDatabaseOperation,
+  withProviderOperation,
+} from "./operation.js";
 import { SQLiteWorkspaceProvider } from "./provider.js";
 import { initializeSchema } from "./schema/index.js";
 import type { Database } from "./storage.js";
@@ -21,6 +26,12 @@ const databaseOperationIsInternal: AssertFalse<
 > = false;
 const providerOperationIsInternal: AssertFalse<
   "withProviderOperation" extends keyof typeof publicApi ? true : false
+> = false;
+const commitCallbackIsInternal: AssertFalse<
+  "afterOutermostCommit" extends keyof typeof publicApi ? true : false
+> = false;
+const rollbackCallbackIsInternal: AssertFalse<
+  "afterOutermostRollback" extends keyof typeof publicApi ? true : false
 > = false;
 
 async function withCountingDatabase<T>(
@@ -45,6 +56,8 @@ describe("database operation views", () => {
   it("keeps the operation API internal and preserves callback return types", async () => {
     expect(databaseOperationIsInternal).toBe(false);
     expect(providerOperationIsInternal).toBe(false);
+    expect(commitCallbackIsInternal).toBe(false);
+    expect(rollbackCallbackIsInternal).toBe(false);
 
     await withDB(async (db) => {
       const syncResult = withDatabaseOperation(db, (operationDb: Database) => {
@@ -149,6 +162,107 @@ describe("database operation views", () => {
 
         expect(counting.snapshot().statements).toBe(6);
       });
+    });
+  });
+});
+
+describe("outermost transaction lifecycle callbacks", () => {
+  it("runs commit callbacks synchronously and exactly once after the outer commit", async () => {
+    await withDB(async (db) => {
+      const events: string[] = [];
+
+      const result = db.transactionSync(() => {
+        afterOutermostCommit(db, () => events.push("commit"));
+        afterOutermostRollback(db, () => events.push("rollback"));
+        expect(events).toEqual([]);
+        return "result";
+      });
+
+      expect(result).toBe("result");
+      expect(events).toEqual(["commit"]);
+    });
+  });
+
+  it("does not fire callbacks when a nested savepoint is released", async () => {
+    await withDB(async (db) => {
+      const events: string[] = [];
+
+      db.transactionSync(() => {
+        db.transactionSync(() => {
+          afterOutermostCommit(db, () => events.push("nested commit"));
+          afterOutermostRollback(db, () => events.push("nested rollback"));
+        });
+
+        expect(events).toEqual([]);
+      });
+
+      expect(events).toEqual(["nested commit"]);
+    });
+  });
+
+  it("fires rollback callbacks and discards commit callbacks after an outer rollback", async () => {
+    await withDB(async (db) => {
+      const events: string[] = [];
+
+      expect(() =>
+        db.transactionSync(() => {
+          afterOutermostCommit(db, () => events.push("outer commit"));
+          afterOutermostRollback(db, () => events.push("outer rollback"));
+
+          db.transactionSync(() => {
+            afterOutermostCommit(db, () => events.push("nested commit"));
+            afterOutermostRollback(db, () => events.push("nested rollback"));
+          });
+
+          expect(events).toEqual([]);
+          throw new Error("roll back outer transaction");
+        }),
+      ).toThrowError("roll back outer transaction");
+
+      expect(events).toEqual(["outer rollback", "nested rollback"]);
+    });
+  });
+
+  it("registers through a sibling view on the shared transaction owner", async () => {
+    await withDB(async (db) => {
+      const events: string[] = [];
+
+      withDatabaseOperation(db, (owner: Database) => {
+        withDatabaseOperation(db, (sibling: Database) => {
+          owner.transactionSync(() => {
+            expect(owner.inTransaction).toBe(true);
+            expect(sibling.inTransaction).toBe(true);
+            afterOutermostCommit(sibling, () => events.push("sibling commit"));
+            afterOutermostRollback(sibling, () => events.push("sibling rollback"));
+            expect(events).toEqual([]);
+          });
+        });
+      });
+
+      expect(events).toEqual(["sibling commit"]);
+    });
+  });
+
+  it("does not retain callbacks after either transaction outcome", async () => {
+    await withDB(async (db) => {
+      const events: string[] = [];
+
+      db.transactionSync(() => {
+        afterOutermostCommit(db, () => events.push("first commit"));
+        afterOutermostRollback(db, () => events.push("first rollback"));
+      });
+      db.transactionSync(() => undefined);
+
+      expect(() =>
+        db.transactionSync(() => {
+          afterOutermostCommit(db, () => events.push("second commit"));
+          afterOutermostRollback(db, () => events.push("second rollback"));
+          throw new Error("second transaction rollback");
+        }),
+      ).toThrowError("second transaction rollback");
+      db.transactionSync(() => undefined);
+
+      expect(events).toEqual(["first commit", "second rollback"]);
     });
   });
 });
