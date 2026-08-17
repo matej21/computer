@@ -2,7 +2,7 @@
 // isomorphic-git + memfs so the index updates are observable
 // through subsequent `statusMatrix` rows.
 
-import git from "isomorphic-git";
+import git, { type FsClient, type PromiseFsClient } from "isomorphic-git";
 import { fs as memfs, vol } from "memfs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,17 +16,81 @@ import {
 const DIR = "/repo";
 const AUTHOR = { name: "t", email: "t@example.test" };
 
-const addClient: IsomorphicGitAddClient = {
-  async add({ fs: _fs, ...args }) {
-    await git.add({ fs: memfs, ...args });
-  },
-  async statusMatrix({ fs: _fs, ...args }) {
-    return git.statusMatrix({ fs: memfs, ...args });
-  },
-  async remove({ fs: _fs, ...args }) {
-    await git.remove({ fs: memfs, ...args });
-  },
-};
+function isPromiseFsClient(fs: object): fs is PromiseFsClient {
+  if (!("promises" in fs) || typeof fs.promises !== "object" || fs.promises === null) {
+    return false;
+  }
+  const promises = fs.promises;
+  return (
+    "readFile" in promises &&
+    typeof promises.readFile === "function" &&
+    "writeFile" in promises &&
+    typeof promises.writeFile === "function" &&
+    "unlink" in promises &&
+    typeof promises.unlink === "function" &&
+    "readdir" in promises &&
+    typeof promises.readdir === "function" &&
+    "mkdir" in promises &&
+    typeof promises.mkdir === "function" &&
+    "rmdir" in promises &&
+    typeof promises.rmdir === "function" &&
+    "stat" in promises &&
+    typeof promises.stat === "function" &&
+    "lstat" in promises &&
+    typeof promises.lstat === "function"
+  );
+}
+
+function requireFsClient(fs: object): FsClient {
+  if (!isPromiseFsClient(fs)) {
+    throw new TypeError("expected the isomorphic-git promise filesystem methods");
+  }
+  return fs;
+}
+
+function forwardingAddClient(options: { broadenStatus?: boolean } = {}): IsomorphicGitAddClient {
+  return {
+    async add({ fs, ...args }) {
+      await git.add({ fs: requireFsClient(fs), ...args });
+    },
+    async statusMatrix({ fs, filepaths, ...args }) {
+      return git.statusMatrix({
+        fs: requireFsClient(fs),
+        ...args,
+        filepaths: options.broadenStatus ? undefined : filepaths,
+      });
+    },
+    async remove({ fs, ...args }) {
+      await git.remove({ fs: requireFsClient(fs), ...args });
+    },
+  };
+}
+
+const addClient = forwardingAddClient();
+
+function dofsLikeTimestampFs(): { promises: typeof memfs.promises } {
+  const promises = new Proxy(memfs.promises, {
+    get(target, property): unknown {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      if (property !== "stat" && property !== "lstat") {
+        return (...args: unknown[]) => Reflect.apply(value, target, args);
+      }
+      return async (...args: unknown[]): Promise<unknown> => {
+        const result: unknown = await Reflect.apply(value, target, args);
+        if (typeof result !== "object" || result === null) return result;
+        return new Proxy(result, {
+          get(stat, statProperty): unknown {
+            if (statProperty === "ctimeMs") return Reflect.get(stat, "mtimeMs", stat);
+            if (statProperty === "ctime") return Reflect.get(stat, "mtime", stat);
+            return Reflect.get(stat, statProperty, stat);
+          },
+        });
+      };
+    },
+  });
+  return { promises };
+}
 
 async function stage(paths: string[], options: { force?: boolean } = {}): Promise<void> {
   await addWith({
@@ -43,8 +107,11 @@ async function init() {
   await git.init({ fs: memfs, dir: DIR, defaultBranch: "main" });
 }
 
-async function statusOf(path: string): Promise<[number, number, number] | undefined> {
-  const matrix = await git.statusMatrix({ fs: memfs, dir: DIR });
+async function statusOf(
+  path: string,
+  fs: FsClient = memfs,
+): Promise<[number, number, number] | undefined> {
+  const matrix = await git.statusMatrix({ fs, dir: DIR });
   const row = matrix.find((r) => r[0] === path);
   if (!row) return undefined;
   return [row[1], row[2], row[3]];
@@ -136,15 +203,19 @@ describe("addWith", () => {
 
       expect(overwrittenStat.size).toBe(6);
       expect(overwrittenStat.mtimeMs).toBeLessThan(indexedFileStat.mtimeMs);
-      expect(Math.floor(overwrittenStat.mtimeMs / 1000)).toBe(
-        Math.floor(indexedFileStat.mtimeMs / 1000),
+      expect(Math.floor(Number(overwrittenStat.mtimeMs) / 1000)).toBe(
+        Math.floor(Number(indexedFileStat.mtimeMs) / 1000),
       );
-      expect(Math.floor(overwrittenStat.ctimeMs / 1000)).toBe(
-        Math.floor(indexedFileStat.ctimeMs / 1000),
+      expect(Math.floor(Number(overwrittenStat.ctimeMs) / 1000)).toBe(
+        Math.floor(Number(indexedFileStat.ctimeMs) / 1000),
       );
       expect(overwrittenStat.mtimeMs).toBeLessThan(indexStat.mtimeMs);
-      expect(Math.floor(overwrittenStat.mtimeMs / 1000)).toBe(Math.floor(indexStat.mtimeMs / 1000));
-      expect(Math.floor(overwrittenStat.ctimeMs / 1000)).toBe(Math.floor(indexStat.ctimeMs / 1000));
+      expect(Math.floor(Number(overwrittenStat.mtimeMs) / 1000)).toBe(
+        Math.floor(Number(indexStat.mtimeMs) / 1000),
+      );
+      expect(Math.floor(Number(overwrittenStat.ctimeMs) / 1000)).toBe(
+        Math.floor(Number(indexStat.ctimeMs) / 1000),
+      );
       expect(await statusOf("earlier-mtime.txt")).toEqual([1, 1, 1]);
 
       await stage(["earlier-mtime.txt"]);
@@ -153,6 +224,59 @@ describe("addWith", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("stages a whole-second racy overwrite when dofs reports ctime equal to earlier mtime", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-17T12:00:00.750Z"));
+    try {
+      const fs = dofsLikeTimestampFs();
+      const path = `${DIR}/dofs-racy.txt`;
+      await memfs.promises.mkdir(DIR, { recursive: true });
+      await git.init({ fs, dir: DIR, defaultBranch: "main" });
+      await memfs.promises.writeFile(path, "alpha\n");
+      await memfs.promises.utimes(path, 0, new Date("2026-08-17T12:00:00.750Z"));
+      await addWith({ git: addClient, fs, dir: DIR, paths: ["dofs-racy.txt"] });
+      await git.commit({ fs, dir: DIR, message: "init", author: AUTHOR });
+      const indexStat = await fs.promises.lstat(`${DIR}/.git/index`);
+
+      await memfs.promises.writeFile(path, "bravo\n");
+      await memfs.promises.utimes(path, 0, new Date("2026-08-17T12:00:00.250Z"));
+      const overwrittenStat = await fs.promises.lstat(path);
+
+      expect(overwrittenStat.mtimeMs).toBe(overwrittenStat.ctimeMs);
+      expect(overwrittenStat.mtimeMs).toBeLessThan(indexStat.mtimeMs);
+      expect(Math.floor(Number(overwrittenStat.mtimeMs) / 1000)).toBe(
+        Math.floor(Number(indexStat.mtimeMs) / 1000),
+      );
+      expect(await statusOf("dofs-racy.txt", fs)).toEqual([1, 1, 1]);
+
+      await addWith({ git: addClient, fs, dir: DIR, paths: ["dofs-racy.txt"] });
+
+      expect(await statusOf("dofs-racy.txt", fs)).toEqual([1, 2, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not stage a changed row outside the requested pathspec", async () => {
+    await init();
+    await memfs.promises.writeFile(`${DIR}/requested.txt`, "before requested\n");
+    await memfs.promises.writeFile(`${DIR}/outside.txt`, "before outside\n");
+    await stage(["requested.txt", "outside.txt"]);
+    await git.commit({ fs: memfs, dir: DIR, message: "init", author: AUTHOR });
+    await memfs.promises.writeFile(`${DIR}/requested.txt`, "after requested\n");
+    await memfs.promises.writeFile(`${DIR}/outside.txt`, "after outside\n");
+
+    await addWith({
+      git: forwardingAddClient({ broadenStatus: true }),
+      fs: memfs,
+      dir: DIR,
+      paths: ["requested.txt"],
+    });
+
+    expect(await statusOf("requested.txt")).toEqual([1, 2, 2]);
+    expect(await statusOf("outside.txt")).toEqual([1, 2, 1]);
   });
 
   it("does not reread a tracked file already equal to the index", async () => {
