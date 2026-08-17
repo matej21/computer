@@ -1,7 +1,12 @@
 import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import type { Database } from "../storage.js";
-import { getBlobBytes } from "./blobCache.js";
+import {
+  cacheBlobBytes,
+  getBlobBytes,
+  hasCompleteFileBytes,
+  markCompleteFileBytes,
+} from "./blobCache.js";
 import { findPendingWriteBuffer } from "./pendingWriteBuffer.js";
 import { resolveInode } from "./resolve.js";
 import { getWriteBuffer } from "./writeBuffer.js";
@@ -22,6 +27,58 @@ interface ChunkRow {
   idx: number;
   hash: Uint8Array;
   size: number;
+  bytes?: Uint8Array | null;
+}
+
+const SMALL_COMPLETE_READ_MAX_BYTES = 64 * 1024;
+
+function readWholeFileChunks(
+  db: Database,
+  inode: number,
+  size: number,
+  includeSmallPayload: boolean,
+): ChunkRow[] {
+  if (
+    includeSmallPayload &&
+    size <= SMALL_COMPLETE_READ_MAX_BYTES &&
+    !hasCompleteFileBytes(db, inode)
+  ) {
+    // Keep missing blobs visible so callers report EIO instead of a short read.
+    return db.all<ChunkRow>(
+      `SELECT c.idx AS idx, c.hash AS hash, c.size AS size, b.bytes AS bytes
+         FROM vfs_chunks c
+         LEFT JOIN vfs_blob_bytes b ON b.hash = c.hash
+        WHERE c.inode = ?
+        ORDER BY c.idx`,
+      inode,
+    );
+  }
+  return db.all<ChunkRow>(
+    "SELECT idx, hash, size FROM vfs_chunks WHERE inode = ? ORDER BY idx",
+    inode,
+  );
+}
+
+/** @internal Reads a complete file for the synchronous provider surface. */
+export function readWholeFileBytes(
+  db: Database,
+  path: string,
+  inode: number,
+  size: number,
+): Uint8Array {
+  const chunks = readWholeFileChunks(db, inode, size, true);
+  const total = chunks.reduce((sum, chunk) => sum + chunk.size, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    const bytes = wholeChunkBytes(db, path, chunk);
+    out.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  if (size <= SMALL_COMPLETE_READ_MAX_BYTES) {
+    markCompleteFileBytes(db, inode);
+  }
+  return out;
 }
 
 // Overloads match docs/04_filesystem_interface.md exactly.
@@ -79,18 +136,21 @@ export async function readFile(
   const { start, end, length } = readWindow(node.size, byteOffset, byteLength);
   const firstIdx = length === 0 ? 0 : Math.floor(start / CHUNK_SIZE);
   const lastIdx = length === 0 ? -1 : Math.floor((end - 1) / CHUNK_SIZE);
+  const completeRead = start === 0 && byteLength === undefined;
   const chunks =
     length === 0
       ? []
-      : db.all<ChunkRow>(
-          `SELECT idx, hash, size
+      : completeRead && wantString
+        ? readWholeFileChunks(db, node.inode, node.size, true)
+        : db.all<ChunkRow>(
+            `SELECT idx, hash, size
              FROM vfs_chunks
             WHERE inode = ? AND idx BETWEEN ? AND ?
             ORDER BY idx`,
-          node.inode,
-          firstIdx,
-          lastIdx,
-        );
+            node.inode,
+            firstIdx,
+            lastIdx,
+          );
   assertDenseRange(chunks, firstIdx, lastIdx, path);
 
   if (wantString) {
@@ -103,6 +163,9 @@ export async function readFile(
       out.set(bytes, written);
       written += bytes.byteLength;
     }
+    if (completeRead && node.size <= SMALL_COMPLETE_READ_MAX_BYTES) {
+      markCompleteFileBytes(db, node.inode);
+    }
     return new TextDecoder().decode(out);
   }
 
@@ -110,16 +173,37 @@ export async function readFile(
   // immutable, so later writes cannot tear the returned range. Pulling stays
   // lazy and preserves backpressure across the RPC stream.
   let index = 0;
-  return new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (index >= chunks.length) {
-        controller.close();
-        return;
-      }
-      const chunk = chunks[index++];
-      controller.enqueue(rangedChunkBytes(db, path, chunk, start, end));
+  return new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (index >= chunks.length) {
+          controller.close();
+          return;
+        }
+        const chunk = chunks[index++];
+        controller.enqueue(rangedChunkBytes(db, path, chunk, start, end));
+        if (completeRead && index === chunks.length && node.size <= SMALL_COMPLETE_READ_MAX_BYTES) {
+          markCompleteFileBytes(db, node.inode);
+        }
+      },
     },
-  });
+    { highWaterMark: 0 },
+  );
+}
+
+function wholeChunkBytes(db: Database, path: string, chunk: ChunkRow): Uint8Array {
+  if (chunk.bytes === null) {
+    throw createWorkspaceError("EIO", `missing blob bytes for ${path}`, path);
+  }
+  if (chunk.bytes !== undefined) {
+    cacheBlobBytes(db, chunk.hash, chunk.bytes);
+    return chunk.bytes;
+  }
+  const bytes = getBlobBytes(db, chunk.hash);
+  if (bytes === undefined) {
+    throw createWorkspaceError("EIO", `missing blob bytes for ${path}`, path);
+  }
+  return bytes;
 }
 
 function validateReadWindow(
@@ -184,10 +268,7 @@ function rangedChunkBytes(
   start: number,
   end: number,
 ): Uint8Array {
-  const bytes = getBlobBytes(db, chunk.hash);
-  if (bytes === undefined) {
-    throw createWorkspaceError("EIO", `missing blob bytes for ${path}`, path);
-  }
+  const bytes = wholeChunkBytes(db, path, chunk);
   const chunkStart = chunk.idx * CHUNK_SIZE;
   const from = Math.max(0, start - chunkStart);
   const to = Math.min(bytes.byteLength, end - chunkStart);

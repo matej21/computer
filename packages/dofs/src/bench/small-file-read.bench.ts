@@ -26,7 +26,7 @@ const targetSmallCompleteRead: StatementCounts = {
   reads: 2,
   writes: 0,
   other: 0,
-  rowsRead: 10,
+  rowsRead: 11,
   rowsWritten: 0,
 };
 
