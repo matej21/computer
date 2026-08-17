@@ -2,6 +2,7 @@ import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import { ROOT_INODE } from "../schema/index.js";
 import type { Database } from "../storage.js";
+import { lookupCompleteDirectoryChild } from "./metadataPrefetch.js";
 import {
   lookupOperationNodeCache,
   lookupResolveCache,
@@ -107,6 +108,29 @@ export function resolveInode(
     if (node !== null) {
       storeResolvedNode(db, toResolved(node));
       return toResolved(node);
+    }
+  }
+
+  const childName = parts.at(-1);
+  if (childName !== undefined) {
+    const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
+    const child = lookupCompleteDirectoryChild(db, parentPath, childName);
+    if (child?.kind === "absent") {
+      storeResolveCache(db, canonical, null);
+      return null;
+    }
+    if (child?.kind === "entry" && child.entry.type !== "symlink") {
+      const node: ResolvedInode = {
+        inode: child.entry.inode,
+        type: child.entry.type,
+        mode: child.entry.mode,
+        mtime: child.entry.mtime,
+        size: child.entry.size,
+        linkTarget: child.entry.linkTarget,
+      };
+      storeResolveCache(db, canonical, node.inode);
+      storeResolvedNode(db, node);
+      return node;
     }
   }
 

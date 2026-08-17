@@ -1,6 +1,13 @@
 import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import type { Database } from "../storage.js";
+import {
+  admitCollectedDirectory,
+  collectDirectoryMetadata,
+  createDirectoryMetadataCollector,
+  type DirectoryMetadataEntry,
+  discardDirectoryMetadataCollector,
+} from "./metadataPrefetch.js";
 import { resolveInode } from "./resolve.js";
 
 export interface WorkspaceFoundEntry {
@@ -19,6 +26,10 @@ interface ChildRow {
   name: string;
   child_inode: number;
   type: "file" | "dir" | "symlink";
+  mode: number;
+  mtime: number;
+  size: number;
+  link_target: string | null;
 }
 
 interface WalkStart {
@@ -98,29 +109,44 @@ function* walk(
   regex: RegExp | undefined,
 ): IterableIterator<WorkspaceFoundEntry> {
   let afterName = "";
-  while (true) {
-    const children = readChildren(db, parentInode, afterName);
-    if (children.length === 0) return;
+  const metadata = createDirectoryMetadataCollector(db, parentPath, parentInode);
+  let admitted = false;
+  try {
+    while (true) {
+      const children = readChildren(db, parentInode, afterName);
+      if (children.length === 0) {
+        admitted = admitCollectedDirectory(db, parentPath, parentInode, metadata);
+        return;
+      }
 
-    for (const child of children) {
-      const childPath = parentPath === "/" ? `/${child.name}` : `${parentPath}/${child.name}`;
-      const relativePath = childPath.slice(prefix.length);
-      if (regex === undefined || regex.test(relativePath)) {
-        yield { path: childPath, type: child.type };
+      for (const child of children) {
+        const childPath = parentPath === "/" ? `/${child.name}` : `${parentPath}/${child.name}`;
+        collectDirectoryMetadata(db, metadata, parentPath, toMetadata(child));
+        const relativePath = childPath.slice(prefix.length);
+        if (regex === undefined || regex.test(relativePath)) {
+          yield { path: childPath, type: child.type };
+        }
+        if (child.type === "dir") {
+          yield* walk(db, child.child_inode, childPath, prefix, regex);
+        }
       }
-      if (child.type === "dir") {
-        yield* walk(db, child.child_inode, childPath, prefix, regex);
+
+      if (children.length < CHILD_PAGE_SIZE) {
+        admitted = admitCollectedDirectory(db, parentPath, parentInode, metadata);
+        return;
       }
+      afterName = children[children.length - 1].name;
     }
-
-    if (children.length < CHILD_PAGE_SIZE) return;
-    afterName = children[children.length - 1].name;
+  } finally {
+    if (!admitted) discardDirectoryMetadataCollector(db, metadata);
   }
 }
 
 function readChildren(db: Database, parentInode: number, afterName: string): ChildRow[] {
   return db.all<ChildRow>(
     `SELECT d.name AS name, d.child_inode AS child_inode, n.type AS type
+            , n.mode AS mode, n.mtime AS mtime, n.size AS size
+            , n.link_target AS link_target
        FROM vfs_dirents d
        JOIN vfs_nodes n ON n.inode = d.child_inode
       WHERE d.parent_inode = ? AND d.name > ?
@@ -130,6 +156,18 @@ function readChildren(db: Database, parentInode: number, afterName: string): Chi
     afterName,
     CHILD_PAGE_SIZE,
   );
+}
+
+function toMetadata(child: ChildRow): DirectoryMetadataEntry {
+  return {
+    inode: child.child_inode,
+    name: child.name,
+    type: child.type,
+    mode: child.mode,
+    mtime: child.mtime,
+    size: child.size,
+    linkTarget: child.link_target ?? undefined,
+  };
 }
 
 // Compile a simple glob into a regex. Supported:

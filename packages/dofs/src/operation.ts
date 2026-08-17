@@ -10,9 +10,13 @@ import {
 
 export interface DatabaseOperationOptions {
   maxReadCacheEntries?: number;
+  maxMetadataPrefetchBytes?: number;
+  maxMetadataPrefetchDirectoryEntries?: number;
 }
 
 const DEFAULT_MAX_READ_CACHE_ENTRIES = 8192;
+const DEFAULT_MAX_METADATA_PREFETCH_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_METADATA_PREFETCH_DIRECTORY_ENTRIES = 20_000;
 
 export function withDatabaseOperation<T>(
   db: Database,
@@ -43,7 +47,20 @@ function runDatabaseOperation<T>(
   const maxReadCacheEntries = Number.isFinite(requested)
     ? Math.max(0, Math.floor(requested))
     : DEFAULT_MAX_READ_CACHE_ENTRIES;
-  const operationDb = createDatabaseOperationView(db, maxReadCacheEntries);
+  const maxMetadataPrefetchBytes = boundedOption(
+    options.maxMetadataPrefetchBytes,
+    DEFAULT_MAX_METADATA_PREFETCH_BYTES,
+  );
+  const maxMetadataPrefetchDirectoryEntries = boundedOption(
+    options.maxMetadataPrefetchDirectoryEntries,
+    DEFAULT_MAX_METADATA_PREFETCH_DIRECTORY_ENTRIES,
+  );
+  const operationDb = createDatabaseOperationView(
+    db,
+    maxReadCacheEntries,
+    maxMetadataPrefetchBytes,
+    maxMetadataPrefetchDirectoryEntries,
+  );
   try {
     const result = run(operationDb);
     if (isPromiseLike(result)) {
@@ -55,6 +72,10 @@ function runDatabaseOperation<T>(
     closeDatabaseOperationView(operationDb);
     throw error;
   }
+}
+
+function boundedOption(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : fallback;
 }
 
 export function withProviderOperation<T>(
