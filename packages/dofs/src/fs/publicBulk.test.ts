@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { CountingStorage } from "../bench/counting-storage.js";
 import { SQLiteWorkspaceProvider } from "../provider.js";
+import { initializeSchema } from "../schema/index.js";
+import { Database } from "../storage.js";
+import { SQLiteTestStorage } from "../testing.js";
 import { clearBlobCache } from "./blobCache.js";
 import { WorkspaceFilesystem } from "./filesystem.js";
 import { link } from "./link.js";
@@ -18,6 +22,20 @@ const WALK_MAX_EXCLUDE_BYTES = 64 * 1024;
 
 async function withFs<T>(run: (fs: WorkspaceFilesystem) => T | Promise<T>): Promise<T> {
   return withDB((db) => run(new WorkspaceFilesystem(db, { now: () => 1000 })));
+}
+
+async function withCountingFs<T>(
+  run: (fs: WorkspaceFilesystem, counting: CountingStorage) => T | Promise<T>,
+): Promise<T> {
+  const inner = new SQLiteTestStorage();
+  const counting = new CountingStorage(inner);
+  const db = new Database(counting);
+  initializeSchema(db, () => 1000);
+  try {
+    return await run(new WorkspaceFilesystem(db, { now: () => 1000 }), counting);
+  } finally {
+    inner.close();
+  }
 }
 
 function decode(bytes: Uint8Array | undefined): string | undefined {
@@ -404,6 +422,35 @@ describe("public bounded bulk filesystem", () => {
       expect(decode(page.entries[1]?.content)).toBe("original");
       expect(decode(page.entries[2]?.content)).toBe("original");
       await expect(fs.readFile("/original", "utf8")).resolves.toBe("original");
+    });
+  });
+
+  it("resolves symlink-heavy readFiles pages with a bounded set of reads", async () => {
+    await withCountingFs(async (fs, counting) => {
+      await fs.mkdir("/targets", { recursive: true });
+      await fs.mkdir("/aliases", { recursive: true });
+      const paths: string[] = [];
+      const expected: string[] = [];
+      for (let index = 0; index < 20; index += 1) {
+        const suffix = index.toString().padStart(2, "0");
+        const content = `content-${suffix}`;
+        await fs.writeFile(`/targets/t${suffix}`, content);
+        await fs.symlink(`/targets/t${suffix}`, `/aliases/l${suffix}`);
+        paths.unshift(`/aliases/l${suffix}`);
+        expected.unshift(content);
+      }
+      counting.reset();
+
+      const page = await fs.readFiles(paths, { limit: paths.length, maxBytes: FILE_MAX_BYTES });
+      const counts = counting.snapshot();
+
+      expect(page.entries.map((entry) => entry.path)).toEqual(paths);
+      expect(page.entries.map((entry) => decode(entry.content))).toEqual(expected);
+      expect(page.cursor).toBeUndefined();
+      expect(counts).toMatchObject({ writes: 0, other: 0 });
+      // Revision, set resolution, and blob assembly are fixed query stages.
+      expect(counts.statements).toBeLessThanOrEqual(6);
+      expect(counts.reads).toBeLessThanOrEqual(6);
     });
   });
 
