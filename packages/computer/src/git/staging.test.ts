@@ -4,7 +4,7 @@
 
 import git from "isomorphic-git";
 import { fs as memfs, vol } from "memfs";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   addWith,
@@ -15,6 +15,28 @@ import {
 
 const DIR = "/repo";
 const AUTHOR = { name: "t", email: "t@example.test" };
+
+const addClient: IsomorphicGitAddClient = {
+  async add({ fs: _fs, ...args }) {
+    await git.add({ fs: memfs, ...args });
+  },
+  async statusMatrix({ fs: _fs, ...args }) {
+    return git.statusMatrix({ fs: memfs, ...args });
+  },
+  async remove({ fs: _fs, ...args }) {
+    await git.remove({ fs: memfs, ...args });
+  },
+};
+
+async function stage(paths: string[], options: { force?: boolean } = {}): Promise<void> {
+  await addWith({
+    git: addClient,
+    fs: memfs,
+    dir: DIR,
+    paths,
+    force: options.force,
+  });
+}
 
 async function init() {
   await memfs.promises.mkdir(DIR, { recursive: true });
@@ -42,6 +64,93 @@ describe("addWith", () => {
     });
     // [head=0, workdir=2, stage=2] — added file, identical in workdir and stage.
     expect(await statusOf("a.txt")).toEqual([0, 2, 2]);
+  });
+
+  it("stages changed explicit paths while leaving unchanged paths unchanged", async () => {
+    await init();
+    await memfs.promises.writeFile(`${DIR}/same.txt`, "same\n");
+    await memfs.promises.writeFile(`${DIR}/changed.txt`, "before\n");
+    await stage(["same.txt", "changed.txt"]);
+    await git.commit({ fs: memfs, dir: DIR, message: "init", author: AUTHOR });
+    await memfs.promises.writeFile(`${DIR}/changed.txt`, "after\n");
+
+    await stage(["same.txt", "changed.txt"]);
+
+    expect(await statusOf("same.txt")).toEqual([1, 1, 1]);
+    expect(await statusOf("changed.txt")).toEqual([1, 2, 2]);
+  });
+
+  it("does not read unchanged files below an explicit directory pathspec", async () => {
+    await init();
+    await memfs.promises.mkdir(`${DIR}/src`, { recursive: true });
+    for (let index = 0; index < 12; index++) {
+      await memfs.promises.writeFile(`${DIR}/src/stable-${index}.txt`, `stable ${index}\n`);
+    }
+    await memfs.promises.writeFile(`${DIR}/src/changed.txt`, "before\n");
+    await stage(["src"]);
+    await git.commit({ fs: memfs, dir: DIR, message: "init", author: AUTHOR });
+    await memfs.promises.writeFile(`${DIR}/src/changed.txt`, "after\n");
+    await memfs.promises.writeFile(`${DIR}/src/new.txt`, "new\n");
+
+    const readFile = vi.spyOn(memfs.promises, "readFile");
+    await stage(["src"]);
+    const unchangedReads = readFile.mock.calls.filter(([path]) =>
+      String(path).includes("/src/stable-"),
+    );
+    readFile.mockRestore();
+
+    expect(await statusOf("src/changed.txt")).toEqual([1, 2, 2]);
+    expect(await statusOf("src/new.txt")).toEqual([0, 2, 2]);
+    expect(await statusOf("src/stable-0.txt")).toEqual([1, 1, 1]);
+    expect(unchangedReads).toHaveLength(0);
+  });
+
+  it("preserves a missing pathspec error", async () => {
+    await init();
+    await expect(stage(["missing.txt"])).rejects.toMatchObject({
+      code: "EPATHSPEC",
+      message: "pathspec 'missing.txt' did not match any files",
+    });
+  });
+
+  it("leaves an ignored path unstaged without force", async () => {
+    await init();
+    await memfs.promises.writeFile(`${DIR}/.gitignore`, "secret.txt\n");
+    await memfs.promises.writeFile(`${DIR}/secret.txt`, "secret\n");
+
+    await stage(["secret.txt"]);
+
+    expect(await statusOf("secret.txt")).toBeUndefined();
+  });
+
+  it("accepts an empty directory pathspec as a no-op", async () => {
+    await init();
+    await memfs.promises.mkdir(`${DIR}/empty`);
+
+    await expect(stage(["empty"])).resolves.toBeUndefined();
+    expect(await git.statusMatrix({ fs: memfs, dir: DIR })).toEqual([]);
+  });
+
+  it("force stages an ignored explicit path without filtering it", async () => {
+    await init();
+    await memfs.promises.writeFile(`${DIR}/.gitignore`, "secret.txt\n");
+    await memfs.promises.writeFile(`${DIR}/secret.txt`, "secret\n");
+
+    await stage(["secret.txt"], { force: true });
+
+    expect(await statusOf("secret.txt")).toEqual([0, 2, 2]);
+  });
+
+  it("preserves the missing-path error for an explicit deletion", async () => {
+    await init();
+    await memfs.promises.writeFile(`${DIR}/gone.txt`, "gone\n");
+    await stage(["gone.txt"]);
+    await git.commit({ fs: memfs, dir: DIR, message: "init", author: AUTHOR });
+    await memfs.promises.unlink(`${DIR}/gone.txt`);
+
+    await expect(stage(["gone.txt"])).rejects.toMatchObject({ code: "EPATHSPEC" });
+
+    expect(await statusOf("gone.txt")).toEqual([1, 0, 1]);
   });
 
   it("stages multiple paths in one call", async () => {
