@@ -31,6 +31,15 @@ export interface OperationNodeEntry {
   linkTarget?: string;
 }
 
+export interface OperationStructuralNode {
+  inode: number;
+  type: "file" | "dir" | "symlink";
+  mode: number;
+  mtime: number;
+  size: number;
+  linkTarget?: string;
+}
+
 const caches = new WeakMap<object, RootResolveCache>();
 
 function cacheFor(db: Database): RootResolveCache {
@@ -99,6 +108,34 @@ export function lookupOperationNodeCache(
 export function storeOperationNodeCache(db: Database, node: OperationNodeEntry): void {
   if (!isDatabaseOperationView(db) || db.inTransaction) return;
   storeDatabaseOperationRead(db, nodeKey(node.inode), node);
+}
+
+export function isOperationStructuralPath(
+  db: Database,
+  canonicalPath: string,
+  inode: number,
+): boolean {
+  if (!isDatabaseOperationView(db) || db.inTransaction) return false;
+  const value = lookupDatabaseOperationRead(db, pathKey(canonicalPath));
+  return isOperationPathEntry(value) && value.inode === inode;
+}
+
+export function storeOperationStructuralNode(
+  db: Database,
+  canonicalPath: string,
+  node: OperationStructuralNode,
+): void {
+  if (!isDatabaseOperationView(db) || db.inTransaction || node.type === "symlink") return;
+  storeResolveCache(db, canonicalPath, node.inode);
+  storeOperationNodeCache(db, {
+    kind: "resolve-node",
+    inode: node.inode,
+    type: node.type,
+    mode: node.mode,
+    mtime: node.mtime,
+    size: node.size,
+    linkTarget: node.linkTarget,
+  });
 }
 
 export function invalidateResolveExact(db: Database, canonicalPath: string): void {

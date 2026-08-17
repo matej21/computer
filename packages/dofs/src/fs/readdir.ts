@@ -1,6 +1,13 @@
 import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import type { Database } from "../storage.js";
+import {
+  admitCollectedDirectory,
+  collectDirectoryMetadata,
+  createDirectoryMetadataCollector,
+  type DirectoryMetadataEntry,
+  lookupCompleteDirectory,
+} from "./metadataPrefetch.js";
 import { resolveInode } from "./resolve.js";
 import { getWriteBuffer, listPendingByParent } from "./writeBuffer.js";
 
@@ -18,6 +25,7 @@ interface DirentRow {
   inode: number;
   name: string;
   type: "file" | "dir" | "symlink";
+  mode: number;
   size: number;
   mtime: number;
   link_target: string | null;
@@ -76,6 +84,12 @@ export function readdir(
     pending = pending.filter((entry) => !committedNameExists(db, node.inode, entry.name));
   }
 
+  const complete = limit === undefined && offset === 0 && pending.length === 0;
+  if (complete) {
+    const cached = lookupCompleteDirectory(db, canonical, node.inode);
+    if (cached !== undefined) return cached.map((entry) => toResult(db, canonical, entry));
+  }
+
   // Pending creates live outside SQLite until their final release. If there
   // are none, let SQLite apply the requested page directly. Otherwise fetch
   // a narrow committed window around the requested page. Every pending entry
@@ -92,7 +106,14 @@ export function readdir(
   const rows = readRows(db, node.inode, queryLimit, queryOffset);
   const entries = rows.map((row) => toResult(db, canonical, row));
 
-  if (pending.length === 0) return entries;
+  if (pending.length === 0) {
+    if (complete) {
+      const collector = createDirectoryMetadataCollector(db, canonical, node.inode);
+      for (const row of rows) collectDirectoryMetadata(db, collector, canonical, toMetadata(row));
+      admitCollectedDirectory(db, canonical, node.inode, collector);
+    }
+    return entries;
+  }
 
   const seen = new Set(entries.map((entry) => entry.name));
   for (const entry of pending) {
@@ -131,6 +152,7 @@ function readRows(
     `SELECT n.inode AS inode,
             d.name AS name,
             n.type AS type,
+            n.mode AS mode,
             n.size AS size,
             n.mtime AS mtime,
             n.link_target AS link_target
@@ -143,7 +165,23 @@ function readRows(
   );
 }
 
-function toResult(db: Database, parentPath: string, row: DirentRow): WorkspaceDirentResult {
+function toMetadata(row: DirentRow): DirectoryMetadataEntry {
+  return {
+    inode: row.inode,
+    name: row.name,
+    type: row.type,
+    mode: row.mode,
+    mtime: row.mtime,
+    size: row.size,
+    linkTarget: row.link_target ?? undefined,
+  };
+}
+
+function toResult(
+  db: Database,
+  parentPath: string,
+  row: DirentRow | DirectoryMetadataEntry,
+): WorkspaceDirentResult {
   const isFile = row.type === "file";
   const isSymbolicLink = row.type === "symlink";
   const buffered = isFile ? getWriteBuffer(db, row.inode) : undefined;
@@ -152,7 +190,7 @@ function toResult(db: Database, parentPath: string, row: DirentRow): WorkspaceDi
       ? buffered.size
       : row.size
     : isSymbolicLink
-      ? (row.link_target ?? "").length
+      ? linkTarget(row).length
       : 0;
   return {
     name: row.name,
@@ -163,6 +201,10 @@ function toResult(db: Database, parentPath: string, row: DirentRow): WorkspaceDi
     isDirectory: row.type === "dir",
     isSymbolicLink,
   };
+}
+
+function linkTarget(row: DirentRow | DirectoryMetadataEntry): string {
+  return "link_target" in row ? (row.link_target ?? "") : (row.linkTarget ?? "");
 }
 
 const filenameEncoder = new TextEncoder();

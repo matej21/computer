@@ -6,8 +6,37 @@ interface OperationState {
   readonly id: number;
   readonly maxReadCacheEntries: number;
   readonly readCache: Map<string, unknown>;
+  readonly maxMetadataPrefetchBytes: number;
+  readonly maxMetadataPrefetchDirectoryEntries: number;
+  readonly metadataDirectories: Map<string, DatabaseOperationDirectory>;
+  readonly metadataReservations: Map<number, number>;
+  metadataPrefetchBytes: number;
+  metadataReservationBytes: number;
+  nextMetadataReservationId: number;
   generation: number;
   closed: boolean;
+}
+
+export interface DatabaseOperationDirectoryEntry {
+  inode: number;
+  name: string;
+  type: "file" | "dir" | "symlink";
+  mode: number;
+  mtime: number;
+  size: number;
+  linkTarget?: string;
+}
+
+export interface DatabaseOperationDirectory {
+  parentInode: number;
+  parentPath: string;
+  entries: readonly DatabaseOperationDirectoryEntry[];
+  entriesByName: ReadonlyMap<string, DatabaseOperationDirectoryEntry>;
+  retainedBytes: number;
+}
+
+export interface DatabaseOperationDirectoryReservation {
+  id: number;
 }
 
 class DatabaseCore {
@@ -34,11 +63,22 @@ class DatabaseCore {
     };
   }
 
-  createOperation(maxReadCacheEntries: number): OperationState {
+  createOperation(
+    maxReadCacheEntries: number,
+    maxMetadataPrefetchBytes: number,
+    maxMetadataPrefetchDirectoryEntries: number,
+  ): OperationState {
     return {
       id: this.nextOperationId++,
       maxReadCacheEntries,
       readCache: new Map(),
+      maxMetadataPrefetchBytes,
+      maxMetadataPrefetchDirectoryEntries,
+      metadataDirectories: new Map(),
+      metadataReservations: new Map(),
+      metadataPrefetchBytes: 0,
+      metadataReservationBytes: 0,
+      nextMetadataReservationId: 1,
       generation: this.coherenceGeneration,
       closed: false,
     };
@@ -208,11 +248,23 @@ function transactNested<T>(core: DatabaseCore, closure: () => T): T {
   }
 }
 
-export function createDatabaseOperationView(db: Database, maxReadCacheEntries: number): Database {
+export function createDatabaseOperationView(
+  db: Database,
+  maxReadCacheEntries: number,
+  maxMetadataPrefetchBytes: number,
+  maxMetadataPrefetchDirectoryEntries: number,
+): Database {
   assertOpen(db);
   const core = coreForDatabase(db);
   const view = new Database(core.storage);
-  operations.set(view, core.createOperation(maxReadCacheEntries));
+  operations.set(
+    view,
+    core.createOperation(
+      maxReadCacheEntries,
+      maxMetadataPrefetchBytes,
+      maxMetadataPrefetchDirectoryEntries,
+    ),
+  );
   return view;
 }
 
@@ -225,7 +277,7 @@ export function closeDatabaseOperationView(db: Database): void {
   const operation = operations.get(db);
   if (operation === undefined || operation.closed) return;
   operation.closed = true;
-  operation.readCache.clear();
+  clearOperationCaches(operation);
 }
 
 export function databaseCoherenceGeneration(db: Database): number {
@@ -250,15 +302,8 @@ export function persistentDatabaseView(db: Database): Database {
 }
 
 export function lookupDatabaseOperationRead(db: Database, key: string): unknown {
-  assertOpen(db);
-  const operation = operations.get(db);
-  if (operation === undefined || db.inTransaction) return undefined;
-  const core = coreForDatabase(db);
-  if (operation.generation !== core.coherenceGeneration) {
-    operation.readCache.clear();
-    operation.generation = core.coherenceGeneration;
-    return undefined;
-  }
+  const operation = readableOperation(db);
+  if (operation === undefined) return undefined;
   const value = operation.readCache.get(key);
   if (value === undefined) return undefined;
   operation.readCache.delete(key);
@@ -267,14 +312,8 @@ export function lookupDatabaseOperationRead(db: Database, key: string): unknown 
 }
 
 export function storeDatabaseOperationRead(db: Database, key: string, value: unknown): void {
-  assertOpen(db);
-  const operation = operations.get(db);
-  if (operation === undefined || db.inTransaction || operation.maxReadCacheEntries === 0) return;
-  const core = coreForDatabase(db);
-  if (operation.generation !== core.coherenceGeneration) {
-    operation.readCache.clear();
-    operation.generation = core.coherenceGeneration;
-  }
+  const operation = readableOperation(db);
+  if (operation === undefined || operation.maxReadCacheEntries === 0) return;
   operation.readCache.delete(key);
   operation.readCache.set(key, value);
   while (operation.readCache.size > operation.maxReadCacheEntries) {
@@ -288,8 +327,120 @@ export function clearDatabaseOperationReadCache(db: Database): void {
   assertOpen(db);
   const operation = operations.get(db);
   if (operation === undefined) return;
-  operation.readCache.clear();
+  clearOperationCaches(operation);
   operation.generation = coreForDatabase(db).coherenceGeneration;
+}
+
+export function lookupDatabaseOperationDirectory(
+  db: Database,
+  parentPath: string,
+  parentInode?: number,
+): DatabaseOperationDirectory | undefined {
+  const operation = readableOperation(db);
+  if (operation === undefined) return undefined;
+  const directory = operation.metadataDirectories.get(parentPath);
+  return parentInode === undefined || directory?.parentInode === parentInode
+    ? directory
+    : undefined;
+}
+
+export function storeDatabaseOperationDirectory(
+  db: Database,
+  directory: DatabaseOperationDirectory,
+  reservation: DatabaseOperationDirectoryReservation,
+): boolean {
+  const operation = readableOperation(db);
+  const reservedBytes = operation?.metadataReservations.get(reservation.id);
+  if (
+    operation === undefined ||
+    reservedBytes === undefined ||
+    reservedBytes !== directory.retainedBytes ||
+    directory.entries.length > operation.maxMetadataPrefetchDirectoryEntries ||
+    directory.retainedBytes > operation.maxMetadataPrefetchBytes - operation.metadataPrefetchBytes
+  ) {
+    return false;
+  }
+  releaseDirectoryReservation(operation, reservation.id);
+  if (operation.metadataDirectories.has(directory.parentPath)) return true;
+  operation.metadataDirectories.set(directory.parentPath, directory);
+  operation.metadataPrefetchBytes += directory.retainedBytes;
+  return true;
+}
+
+export function createDatabaseOperationDirectoryReservation(
+  db: Database,
+  bytes: number,
+): DatabaseOperationDirectoryReservation | undefined {
+  const operation = readableOperation(db);
+  if (operation === undefined || !reserveDirectoryBytes(operation, bytes)) return undefined;
+  const id = operation.nextMetadataReservationId++;
+  operation.metadataReservations.set(id, bytes);
+  return { id };
+}
+
+export function reserveDatabaseOperationDirectoryBytes(
+  db: Database,
+  reservation: DatabaseOperationDirectoryReservation,
+  bytes: number,
+): boolean {
+  const operation = readableOperation(db);
+  if (operation === undefined || !operation.metadataReservations.has(reservation.id)) return false;
+  if (!reserveDirectoryBytes(operation, bytes)) return false;
+  operation.metadataReservations.set(
+    reservation.id,
+    (operation.metadataReservations.get(reservation.id) ?? 0) + bytes,
+  );
+  return true;
+}
+
+export function releaseDatabaseOperationDirectoryReservation(
+  db: Database,
+  reservation: DatabaseOperationDirectoryReservation,
+): void {
+  const operation = operations.get(db);
+  if (operation === undefined) return;
+  releaseDirectoryReservation(operation, reservation.id);
+}
+
+export function databaseOperationDirectoryMaxEntries(db: Database): number | undefined {
+  return readableOperation(db)?.maxMetadataPrefetchDirectoryEntries;
+}
+
+function reserveDirectoryBytes(operation: OperationState, bytes: number): boolean {
+  const available =
+    operation.maxMetadataPrefetchBytes -
+    operation.metadataPrefetchBytes -
+    operation.metadataReservationBytes;
+  if (bytes > available) return false;
+  operation.metadataReservationBytes += bytes;
+  return true;
+}
+
+function releaseDirectoryReservation(operation: OperationState, id: number): void {
+  const bytes = operation.metadataReservations.get(id);
+  if (bytes === undefined) return;
+  operation.metadataReservations.delete(id);
+  operation.metadataReservationBytes -= bytes;
+}
+
+function readableOperation(db: Database): OperationState | undefined {
+  assertOpen(db);
+  const operation = operations.get(db);
+  const core = coreForDatabase(db);
+  if (operation === undefined || core.transactionDepth > 0) return undefined;
+  if (operation.generation !== core.coherenceGeneration) {
+    clearOperationCaches(operation);
+    operation.generation = core.coherenceGeneration;
+  }
+  return operation;
+}
+
+function clearOperationCaches(operation: OperationState): void {
+  operation.readCache.clear();
+  operation.metadataDirectories.clear();
+  operation.metadataReservations.clear();
+  operation.metadataPrefetchBytes = 0;
+  operation.metadataReservationBytes = 0;
 }
 
 export function registerAfterOutermostCommit(db: Database, callback: TransactionCallback): void {
