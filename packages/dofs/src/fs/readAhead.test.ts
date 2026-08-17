@@ -347,6 +347,38 @@ describe("operation-local small-file read-ahead", () => {
     });
   });
 
+  it("stops probing when the complete-read exclusion history is full", async () => {
+    await withCountingDatabase(async (db, provider) => {
+      const readHistoryEntries = 4000;
+      seedEmptyFiles(db, "/history", readHistoryEntries);
+      const targetPaths = writeSmallDirectory(provider, "/after-history", 5);
+      resetReadCaches(db);
+
+      await withDatabaseOperation(db, async (operationDb: Database) => {
+        for (let index = 0; index < readHistoryEntries; index += 1) {
+          const name = `m-empty-${index.toString().padStart(5, "0")}`;
+          await expect(readText(operationDb, `/history/${name}`)).resolves.toBe("");
+        }
+
+        for (const path of targetPaths.slice(0, 4)) {
+          await readText(operationDb, path);
+        }
+        const recording = recordQueries(operationDb);
+        try {
+          await expect(readText(operationDb, targetPaths[0])).resolves.toBe("object 0");
+          expect.soft(payloadReads(recording.records)).toHaveLength(0);
+          expect(
+            recording.records.some((record) =>
+              record.query.includes("candidate_input AS MATERIALIZED"),
+            ),
+          ).toBe(false);
+        } finally {
+          recording.stop();
+        }
+      });
+    });
+  });
+
   it("keeps speculative bytes local while handing requested bytes to the shared cache", async () => {
     await withCountingDatabase(async (db, provider) => {
       const paths = writeSmallDirectory(provider, "/shared", 12);
