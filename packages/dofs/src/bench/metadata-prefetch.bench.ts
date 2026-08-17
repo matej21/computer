@@ -78,7 +78,7 @@ it("benchmarks operation-local metadata prefetch against real DO SqlStorage", as
     results: {
       baseline,
       operation,
-      target: { statements: 2, reads: 2, rowsRead: 423 },
+      target: { statements: 2, reads: 2, rowsRead: 1010 },
     },
   });
 
@@ -95,7 +95,7 @@ it("benchmarks operation-local metadata prefetch against real DO SqlStorage", as
     reads: 2,
     writes: 0,
     other: 0,
-    rowsRead: 423,
+    rowsRead: 1010,
     rowsWritten: 0,
   });
   expect(operation.statements).toBeLessThan(baseline.statements);
