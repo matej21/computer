@@ -155,8 +155,8 @@ it("benchmarks filesystem mutations against real DO SqlStorage", async () => {
   });
   const subtreeRenameSignature: StatementCounts = {
     statements: 19,
-    reads: 16,
-    writes: 3,
+    reads: 14,
+    writes: 5,
     other: 0,
     rowsRead: 1518,
     rowsWritten: 2515,

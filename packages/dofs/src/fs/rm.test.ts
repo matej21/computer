@@ -9,7 +9,9 @@ import { resolveInode } from "./resolve.js";
 import { rm } from "./rm.js";
 import { symlink } from "./symlink.js";
 import { withDB } from "./with-db.js";
+import { listPendingWriteBuffers } from "./writeBuffer.js";
 import {
+  openWriteBufferForCreateSync,
   openWriteBufferSync,
   releaseWriteBufferSync,
   writeFile,
@@ -308,6 +310,119 @@ describe("rm", () => {
       expect(await readFile(db, "/tree/sub/b", "utf8")).toBe("b");
       expect(db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'")).toBe(beforeRev);
       expect(listChanges(db)).toEqual(beforeChanges);
+    });
+  });
+
+  it("defers live-buffer cleanup until the outer transaction commits", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/tree", {}, () => 0);
+      await writeFile(db, "/tree/live.txt", "original", {}, () => 0);
+      openWriteBufferSync(db, "/tree/live.txt");
+      writeRangeSync(db, "/tree/live.txt", new TextEncoder().encode("updated!"), 0, {}, () => 1);
+
+      expect(() =>
+        db.transactionSync(() => {
+          rm(db, "/tree", { recursive: true });
+          expect(resolveInode(db, "/tree/live.txt")).toBeNull();
+          throw new Error("roll back outer transaction");
+        }),
+      ).toThrow("roll back outer transaction");
+
+      expect(resolveInode(db, "/tree/live.txt")).not.toBeNull();
+      expect(await readFile(db, "/tree/live.txt", "utf8")).toBe("updated!");
+      releaseWriteBufferSync(db, "/tree/live.txt", () => 2);
+      expect(await readFile(db, "/tree/live.txt", "utf8")).toBe("updated!");
+    });
+  });
+
+  it("discards pending-create descendants only after recursive rm commits", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/tree", {}, () => 0);
+      openWriteBufferForCreateSync(db, "/tree/pending.txt", {}, () => 0);
+      writeRangeSync(
+        db,
+        "/tree/pending.txt",
+        new TextEncoder().encode("pending bytes"),
+        0,
+        {},
+        () => 1,
+      );
+      expect(listPendingWriteBuffers(db)).toHaveLength(1);
+
+      rm(db, "/tree", { recursive: true });
+
+      expect(listPendingWriteBuffers(db)).toHaveLength(0);
+      await expect(readFile(db, "/tree/pending.txt", "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(() => releaseWriteBufferSync(db, "/tree/pending.txt", () => 2)).toThrowError(
+        expect.objectContaining({ code: "ENOENT" }),
+      );
+      mkdir(db, "/tree", {}, () => 3);
+      expect(resolveInode(db, "/tree/pending.txt")).toBeNull();
+    });
+  });
+
+  it("restores pending-create descendants when an outer recursive rm rolls back", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/tree", {}, () => 0);
+      openWriteBufferForCreateSync(db, "/tree/pending.txt", {}, () => 0);
+      writeRangeSync(
+        db,
+        "/tree/pending.txt",
+        new TextEncoder().encode("pending bytes"),
+        0,
+        {},
+        () => 1,
+      );
+
+      expect(() =>
+        db.transactionSync(() => {
+          rm(db, "/tree", { recursive: true });
+          throw new Error("roll back pending removal");
+        }),
+      ).toThrow("roll back pending removal");
+
+      expect(listPendingWriteBuffers(db)).toHaveLength(1);
+      expect(await readFile(db, "/tree/pending.txt", "utf8")).toBe("pending bytes");
+      releaseWriteBufferSync(db, "/tree/pending.txt", () => 2);
+      expect(await readFile(db, "/tree/pending.txt", "utf8")).toBe("pending bytes");
+    });
+  });
+
+  it("recursive removes a subtree just beyond one delete page", async () => {
+    await withDB((db) => {
+      const descendants = 10_001;
+      mkdir(db, "/tree", {}, () => 0);
+      const treeInode = resolveInode(db, "/tree")?.inode;
+      if (treeInode === undefined) throw new Error("fixture tree inode is missing");
+      const firstInode = (db.scalar<number>("SELECT MAX(inode) FROM vfs_nodes") ?? 0) + 1;
+      const inodes = Array.from({ length: descendants }, (_, index) => firstInode + index);
+      const encodedInodes = JSON.stringify(inodes);
+      db.run(
+        `INSERT INTO vfs_nodes (inode, type, mode, mtime, rev, size)
+         SELECT value, 'file', 420, 0, 0, 0 FROM json_each(?)`,
+        encodedInodes,
+      );
+      db.run(
+        `INSERT INTO vfs_dirents (parent_inode, name, child_inode)
+         SELECT ?, printf('f%05d', key), value FROM json_each(?)`,
+        treeInode,
+        encodedInodes,
+      );
+
+      rm(db, "/tree", { recursive: true });
+
+      expect(resolveInode(db, "/tree")).toBeNull();
+      expect(
+        db.scalar<number>(
+          "SELECT COUNT(*) FROM vfs_nodes WHERE inode IN (SELECT value FROM json_each(?))",
+          encodedInodes,
+        ),
+      ).toBe(0);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM vfs_changes WHERE path LIKE '/tree/%'")).toBe(
+        descendants,
+      );
     });
   });
 
