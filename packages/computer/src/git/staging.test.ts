@@ -114,6 +114,47 @@ describe("addWith", () => {
     }
   });
 
+  it("stages a same-size overwrite whose raw mtime is earlier within the index second", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-17T12:00:00.750Z"));
+    try {
+      const path = `${DIR}/earlier-mtime.txt`;
+      await init();
+      await memfs.promises.writeFile(path, "alpha\n");
+      const indexedFileStat = await memfs.promises.stat(path);
+      await stage(["earlier-mtime.txt"]);
+      await git.commit({ fs: memfs, dir: DIR, message: "init", author: AUTHOR });
+      const indexStat = await memfs.promises.stat(`${DIR}/.git/index`);
+
+      await memfs.promises.writeFile(path, "bravo\n");
+      await memfs.promises.utimes(
+        path,
+        new Date("2026-08-17T12:00:00.250Z"),
+        new Date("2026-08-17T12:00:00.250Z"),
+      );
+      const overwrittenStat = await memfs.promises.stat(path);
+
+      expect(overwrittenStat.size).toBe(6);
+      expect(overwrittenStat.mtimeMs).toBeLessThan(indexedFileStat.mtimeMs);
+      expect(Math.floor(overwrittenStat.mtimeMs / 1000)).toBe(
+        Math.floor(indexedFileStat.mtimeMs / 1000),
+      );
+      expect(Math.floor(overwrittenStat.ctimeMs / 1000)).toBe(
+        Math.floor(indexedFileStat.ctimeMs / 1000),
+      );
+      expect(overwrittenStat.mtimeMs).toBeLessThan(indexStat.mtimeMs);
+      expect(Math.floor(overwrittenStat.mtimeMs / 1000)).toBe(Math.floor(indexStat.mtimeMs / 1000));
+      expect(Math.floor(overwrittenStat.ctimeMs / 1000)).toBe(Math.floor(indexStat.ctimeMs / 1000));
+      expect(await statusOf("earlier-mtime.txt")).toEqual([1, 1, 1]);
+
+      await stage(["earlier-mtime.txt"]);
+
+      expect(await statusOf("earlier-mtime.txt")).toEqual([1, 2, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not reread a tracked file already equal to the index", async () => {
     await init();
     await memfs.promises.writeFile(`${DIR}/tracked.txt`, "tracked\n");
