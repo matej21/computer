@@ -111,9 +111,15 @@ export function listPendingByParent(db: Database, parentInode: number): WriteBuf
 }
 
 export function listPendingWriteBuffers(db: Database): WriteBufferEntry[] {
+  return [...iteratePendingWriteBuffers(db)];
+}
+
+export function* iteratePendingWriteBuffers(db: Database): IterableIterator<WriteBufferEntry> {
   const cache = caches.get(databaseCoreKey(db));
-  if (cache === undefined) return [];
-  return [...cache.byInode.values()].filter((entry) => entry.pending !== undefined);
+  if (cache === undefined) return;
+  for (const entry of cache.byInode.values()) {
+    if (entry.pending !== undefined) yield entry;
+  }
 }
 
 export function listDirtyWriteBufferInodes(db: Database): number[] {

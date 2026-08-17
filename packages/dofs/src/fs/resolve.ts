@@ -34,6 +34,109 @@ export interface ResolveOptions {
   followSymlinks?: boolean;
 }
 
+interface ManyCteRow extends CteRow {
+  pid: number;
+}
+
+const MANY_QUERY = `
+WITH RECURSIVE
+  paths(pid, segs, depth) AS (
+    SELECT key, value, json_array_length(value) FROM json_each(?)
+  ),
+  walk(pid, segs, depth, level, inode, type, mode, mtime, size, link_target) AS (
+    SELECT p.pid, p.segs, p.depth, 0,
+           n.inode, n.type, n.mode, n.mtime, n.size, n.link_target
+      FROM paths p JOIN vfs_nodes n ON n.inode = ?
+    UNION ALL
+    SELECT w.pid, w.segs, w.depth, w.level + 1,
+           n.inode, n.type, n.mode, n.mtime, n.size, n.link_target
+      FROM walk w
+      JOIN vfs_dirents d
+        ON d.parent_inode = w.inode
+       AND d.name = json_extract(w.segs, '$[' || w.level || ']')
+      JOIN vfs_nodes n ON n.inode = d.child_inode
+     WHERE w.type = 'dir' AND w.level < w.depth
+  )
+SELECT pid, level, inode, type, mode, mtime, size, link_target
+  FROM walk ORDER BY pid, level`;
+
+export function resolveMany(db: Database, paths: readonly string[]): (ResolvedInode | null)[] {
+  if (paths.length === 0) return [];
+  const prepared = paths.map((path) => canonicalizePath(path));
+  const pending = prepared.map((entry, index) => ({
+    index,
+    parts: entry.parts,
+    follows: 0,
+    followed: false,
+  }));
+  const results = new Array<ResolvedInode | null>(prepared.length).fill(null);
+
+  while (pending.length > 0) {
+    const uniqueParts: string[][] = [];
+    const uniqueIds = new Map<string, number>();
+    const pendingIds: number[] = [];
+    for (const entry of pending) {
+      const key = JSON.stringify(entry.parts);
+      let id = uniqueIds.get(key);
+      if (id === undefined) {
+        id = uniqueParts.length;
+        uniqueIds.set(key, id);
+        uniqueParts.push(entry.parts);
+      }
+      pendingIds.push(id);
+    }
+    const rows = db.all<ManyCteRow>(MANY_QUERY, JSON.stringify(uniqueParts), ROOT_INODE);
+    const byPath = new Map<number, ManyCteRow[]>();
+    for (const row of rows) {
+      const held = byPath.get(row.pid);
+      if (held === undefined) byPath.set(row.pid, [row]);
+      else held.push(row);
+    }
+
+    const next: typeof pending = [];
+    for (const [pendingIndex, entry] of pending.entries()) {
+      const walked = byPath.get(pendingIds[pendingIndex]) ?? [];
+      const link = walked.find((row) => row.level >= 1 && row.type === "symlink");
+      if (link !== undefined) {
+        const follows = entry.follows + 1;
+        if (follows > MAX_SYMLINK_FOLLOWS) {
+          throw createWorkspaceError("ELOOP", "too many symlinks resolving path");
+        }
+        next.push({
+          index: entry.index,
+          parts: expandSymlinkParts(entry.parts, link.level, link.link_target ?? ""),
+          follows,
+          followed: true,
+        });
+        continue;
+      }
+      const target = walked.find((row) => row.level === entry.parts.length);
+      const node = target === undefined ? null : toResolved(target);
+      results[entry.index] = node;
+      if (!entry.followed) {
+        storeResolveCache(db, prepared[entry.index].path, node === null ? null : node.inode);
+      }
+      if (node !== null) storeResolvedNode(db, node);
+    }
+    pending.splice(0, pending.length, ...next);
+  }
+
+  return results;
+}
+
+function expandSymlinkParts(parts: readonly string[], level: number, target: string): string[] {
+  const expanded = target.startsWith("/") ? [] : parts.slice(0, level - 1);
+  for (const part of [...target.split("/"), ...parts.slice(level)]) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      expanded.pop();
+    } else {
+      expanded.push(part);
+    }
+  }
+  return expanded;
+}
+
 interface NodeRow {
   inode: number;
   type: "file" | "dir" | "symlink";

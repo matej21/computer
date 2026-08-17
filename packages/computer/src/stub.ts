@@ -41,16 +41,21 @@
 
 import { trackStub, untrackStub } from "@cloudflare/computer-rpc/debug";
 import type {
+  BulkPage,
   FindOptions,
   GrepOptions,
   MkdirOptions,
   ReaddirOptions,
   ReadFileOptions,
+  ReadFilesEntry,
+  ReadFilesOptions,
   RmOptions,
+  WalkOptions,
   WorkspaceDirentResult,
   WorkspaceFoundEntry,
   WorkspaceGrepMatch,
   WorkspaceStatResult,
+  WorkspaceWalkEntry,
   WriteFileContent,
   WriteFileOptions,
 } from "@cloudflare/dofs";
@@ -176,6 +181,27 @@ export class WorkspaceFilesystemStub extends RpcTarget {
   readlink(path: string): Promise<string> {
     return withSpan(this.#ws.observer, "workspace.fs.readlink", { "workspace.fs.path": path }, () =>
       this.#ws.fs.readlink(path),
+    );
+  }
+
+  walk(directory: string, options: WalkOptions): Promise<BulkPage<WorkspaceWalkEntry>> {
+    return withSpan(
+      this.#ws.observer,
+      "workspace.fs.walk",
+      { "workspace.fs.path": directory },
+      () => this.#ws.fs.walk(directory, options),
+    );
+  }
+
+  readFiles(
+    paths: readonly string[],
+    options: ReadFilesOptions,
+  ): Promise<BulkPage<ReadFilesEntry>> {
+    return withSpan(
+      this.#ws.observer,
+      "workspace.fs.readFiles",
+      { "workspace.fs.paths": paths.length },
+      () => this.#ws.fs.readFiles(paths, options),
     );
   }
 

@@ -5,6 +5,7 @@ export type WorkspaceErrorCode =
   | "EISDIR"
   | "EEXIST"
   | "EINVAL"
+  | "ESTALE"
   | "EACCES"
   | "EPERM"
   | "EROFS"

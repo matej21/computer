@@ -17,9 +17,15 @@
 
 export type {
   ApplyResult,
+  BulkEntryError,
+  BulkPage,
   DurableObjectStorageLike,
+  ReadFilesEntry,
+  ReadFilesOptions,
   SkippedEntry,
   SQLiteWorkspaceProviderOptions,
+  WalkOptions,
+  WorkspaceWalkEntry,
 } from "@cloudflare/dofs";
 export { SQLiteWorkspaceProvider } from "@cloudflare/dofs";
 export type { BackendHandle, WorkspaceBackend } from "./backend.js";
@@ -70,6 +76,7 @@ export type {
   WorkspaceRuntimeEvent,
   WorkspaceRuntimeExecHandle,
   WorkspaceRuntimeExecOptions,
+  WorkspaceRuntimeFilesystem,
   WorkspaceRuntimeGetOptions,
   WorkspaceRuntimeKillOptions,
   WorkspaceRuntimeLoader,
