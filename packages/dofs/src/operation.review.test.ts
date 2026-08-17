@@ -5,7 +5,7 @@ import { clearBlobCache } from "./fs/blobCache.js";
 import { getReadOnlyMountRoots, invalidateReadOnlyMountCache } from "./fs/mount-guard.js";
 import { resolveInode } from "./fs/resolve.js";
 import { withDB } from "./fs/with-db.js";
-import { getWriteBuffer } from "./fs/writeBuffer.js";
+import { deleteWriteBuffer, getWriteBuffer } from "./fs/writeBuffer.js";
 import {
   afterOutermostCommit,
   afterOutermostRollback,
@@ -148,16 +148,16 @@ describe("provider operation semantic state", () => {
       const provider = new SQLiteWorkspaceProvider(db, { now: NOW });
       provider.writeFileSync("/file", "initial");
       provider.openWriteBufferSync("/file");
-      provider.writeRangeSync("/file", "root", 0);
+      provider.writeRangeSync("/file", "ROOTIAL", 0);
 
       withProviderOperation(provider, (operationProvider: SQLiteWorkspaceProvider) => {
-        expect(operationProvider.readFileSync("/file", "utf8")).toBe("root");
-        operationProvider.writeRangeSync("/file", "operation", 0);
+        expect(operationProvider.readFileSync("/file", "utf8")).toBe("ROOTIAL");
+        operationProvider.writeRangeSync("/file", "UPDATED", 0);
         operationProvider.releaseWriteBufferSync("/file");
       });
 
       provider.releaseWriteBufferSync("/file");
-      expect(provider.readFileSync("/file", "utf8")).toBe("operation");
+      expect(provider.readFileSync("/file", "utf8")).toBe("UPDATED");
     });
   });
 
@@ -223,7 +223,7 @@ describe("provider operation semantic state", () => {
       const provider = new SQLiteWorkspaceProvider(db, { now: NOW });
       provider.writeFileSync("/file", "initial");
       provider.openWriteBufferSync("/file");
-      provider.writeRangeSync("/file", "dirty", 0);
+      provider.writeRangeSync("/file", "DIRTIED", 0);
       const inode = resolveInode(db, "/file")?.inode;
       if (inode === undefined) throw new Error("fixture inode missing");
 
@@ -236,7 +236,35 @@ describe("provider operation semantic state", () => {
       });
 
       expect(getWriteBuffer(db, inode) === undefined).toBe(true);
-      expect(provider.readFileSync("/file", "utf8")).toBe("dirty");
+      expect(provider.readFileSync("/file", "utf8")).toBe("DIRTIED");
+    });
+  });
+
+  it("runs operation cleanup after a surrounding root transaction commits", async () => {
+    await withDB(async (db) => {
+      const provider = new SQLiteWorkspaceProvider(db, { now: NOW });
+      provider.writeFileSync("/file", "initial");
+      provider.openWriteBufferSync("/file");
+      provider.writeRangeSync("/file", "DIRTIED", 0);
+      const inode = resolveInode(db, "/file")?.inode;
+      if (inode === undefined) throw new Error("fixture inode missing");
+
+      let escaped: SQLiteWorkspaceProvider | undefined;
+      db.transactionSync(() => {
+        withProviderOperation(provider, (operationProvider: SQLiteWorkspaceProvider) => {
+          escaped = operationProvider;
+          afterOutermostCommit(operationProvider.db, () => {
+            deleteWriteBuffer(operationProvider.db, inode);
+          });
+        });
+
+        const closedProvider = escaped;
+        if (closedProvider === undefined) throw new Error("operation callback did not run");
+        expect(() => closedProvider.statSync("/file")).toThrowError("Database operation is closed");
+        expect(getWriteBuffer(db, inode)).toBeDefined();
+      });
+
+      expect(getWriteBuffer(db, inode)).toBeUndefined();
     });
   });
 });
@@ -258,6 +286,74 @@ describe("provider operation watcher lifetime", () => {
         await expect(event).resolves.toEqual({ eventType: "change", filename: "file" });
       } finally {
         watcher.close();
+      }
+    });
+  });
+
+  it("keeps created handles alive but rejects calls through the escaped provider", async () => {
+    await withDB(async (db) => {
+      const provider = new SQLiteWorkspaceProvider(db, { now: NOW, watchIntervalMs: 10 });
+      provider.writeFileSync("/file", "hello");
+      provider.mkdirSync("/watched");
+
+      let escaped: SQLiteWorkspaceProvider | undefined;
+      let fd: number | undefined;
+      let watcher: ProviderWatcher | undefined;
+      withProviderOperation(provider, (operationProvider: SQLiteWorkspaceProvider) => {
+        escaped = operationProvider;
+        fd = operationProvider.openSync("/file", "r+");
+        watcher = operationProvider.watch("/watched", { interval: 10 });
+      });
+
+      const closedProvider = escaped;
+      const openFd = fd;
+      const openWatcher = watcher;
+      if (closedProvider === undefined || openFd === undefined || openWatcher === undefined) {
+        throw new Error("operation handles were not created");
+      }
+
+      let lateWatcher: ProviderWatcher | undefined;
+      try {
+        provider.writeSync(openFd, Buffer.from("HELLO"), 0, 5, 0);
+        const bytes = Buffer.alloc(5);
+        expect(provider.readSync(openFd, bytes, 0, 5, 0)).toBe(5);
+        expect(bytes.toString()).toBe("HELLO");
+
+        const event = nextWatchEvent(openWatcher);
+        provider.writeFileSync("/watched/event", "content");
+        await expect(event).resolves.toEqual({ eventType: "change", filename: "event" });
+
+        expect
+          .soft(() => closedProvider.statSync("/file"))
+          .toThrowError("Database operation is closed");
+        expect
+          .soft(() => {
+            lateWatcher = closedProvider.watch("/watched", { interval: 10 });
+          })
+          .toThrowError("Database operation is closed");
+        expect
+          .soft(() => closedProvider.readSync(openFd, Buffer.alloc(1), 0, 1, 0))
+          .toThrowError("Database operation is closed");
+        expect
+          .soft(() => closedProvider.writeSync(openFd, Buffer.from("WORLD"), 0, 5, 0))
+          .toThrowError("Database operation is closed");
+        expect
+          .soft(() => closedProvider.fstatSync(openFd))
+          .toThrowError("Database operation is closed");
+        expect
+          .soft(() => closedProvider.ftruncateSync(openFd, 5))
+          .toThrowError("Database operation is closed");
+        expect
+          .soft(() => closedProvider.closeSync(openFd))
+          .toThrowError("Database operation is closed");
+      } finally {
+        lateWatcher?.close();
+        openWatcher.close();
+        try {
+          provider.closeSync(openFd);
+        } catch {
+          // The rejected implementation closes the shared descriptor through the escaped view.
+        }
       }
     });
   });
