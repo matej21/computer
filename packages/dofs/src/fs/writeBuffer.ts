@@ -116,6 +116,16 @@ export function listPendingWriteBuffers(db: Database): WriteBufferEntry[] {
   return [...cache.byInode.values()].filter((entry) => entry.pending !== undefined);
 }
 
+export function listDirtyWriteBufferInodes(db: Database): number[] {
+  const cache = caches.get(databaseCoreKey(db));
+  if (cache === undefined) return [];
+  const inodes: number[] = [];
+  for (const [inode, entry] of cache.byInode) {
+    if (inode >= 0 && entry.dirty) inodes.push(inode);
+  }
+  return inodes;
+}
+
 export function setWriteBuffer(db: Database, inode: number, entry: WriteBufferEntry): void {
   const cache = cacheFor(db);
   cache.byInode.set(inode, entry);

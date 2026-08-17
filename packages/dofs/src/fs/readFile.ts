@@ -8,6 +8,7 @@ import {
   markCompleteFileBytes,
 } from "./blobCache.js";
 import { findPendingWriteBuffer } from "./pendingWriteBuffer.js";
+import { noteCompleteSmallFileRead, takeOrReadAheadCompleteFile } from "./readAhead.js";
 import { resolveInode } from "./resolve.js";
 import { getWriteBuffer } from "./writeBuffer.js";
 import { CHUNK_SIZE } from "./writeFile.js";
@@ -66,6 +67,11 @@ export function readWholeFileBytes(
   inode: number,
   size: number,
 ): Uint8Array {
+  const ahead = takeOrReadAheadCompleteFile(db, path, inode, size);
+  if (ahead !== undefined) {
+    noteCompleteSmallFileRead(db, path, inode, size);
+    return ahead;
+  }
   const chunks = readWholeFileChunks(db, inode, size, true);
   const total = chunks.reduce((sum, chunk) => sum + chunk.size, 0);
   const out = new Uint8Array(total);
@@ -77,6 +83,7 @@ export function readWholeFileBytes(
   }
   if (size <= SMALL_COMPLETE_READ_MAX_BYTES) {
     markCompleteFileBytes(db, inode);
+    noteCompleteSmallFileRead(db, path, inode, size);
   }
   return out;
 }
@@ -137,6 +144,13 @@ export async function readFile(
   const firstIdx = length === 0 ? 0 : Math.floor(start / CHUNK_SIZE);
   const lastIdx = length === 0 ? -1 : Math.floor((end - 1) / CHUNK_SIZE);
   const completeRead = start === 0 && byteLength === undefined;
+  if (completeRead && wantString && node.size <= SMALL_COMPLETE_READ_MAX_BYTES) {
+    const ahead = takeOrReadAheadCompleteFile(db, canonical, node.inode, node.size);
+    if (ahead !== undefined) {
+      noteCompleteSmallFileRead(db, canonical, node.inode, node.size);
+      return new TextDecoder().decode(ahead);
+    }
+  }
   const chunks =
     length === 0
       ? []
@@ -165,6 +179,7 @@ export async function readFile(
     }
     if (completeRead && node.size <= SMALL_COMPLETE_READ_MAX_BYTES) {
       markCompleteFileBytes(db, node.inode);
+      noteCompleteSmallFileRead(db, canonical, node.inode, node.size);
     }
     return new TextDecoder().decode(out);
   }
@@ -173,17 +188,33 @@ export async function readFile(
   // immutable, so later writes cannot tear the returned range. Pulling stays
   // lazy and preserves backpressure across the RPC stream.
   let index = 0;
+  let checkedReadAhead = false;
   return new ReadableStream<Uint8Array>(
     {
       pull(controller) {
+        if (!checkedReadAhead && completeRead && node.size <= SMALL_COMPLETE_READ_MAX_BYTES) {
+          checkedReadAhead = true;
+          const ahead = takeOrReadAheadCompleteFile(db, canonical, node.inode, node.size);
+          if (ahead !== undefined) {
+            if (ahead.byteLength > 0) controller.enqueue(ahead);
+            controller.close();
+            noteCompleteSmallFileRead(db, canonical, node.inode, node.size);
+            return;
+          }
+        }
         if (index >= chunks.length) {
           controller.close();
+          if (completeRead && node.size <= SMALL_COMPLETE_READ_MAX_BYTES) {
+            markCompleteFileBytes(db, node.inode);
+            noteCompleteSmallFileRead(db, canonical, node.inode, node.size);
+          }
           return;
         }
         const chunk = chunks[index++];
         controller.enqueue(rangedChunkBytes(db, path, chunk, start, end));
         if (completeRead && index === chunks.length && node.size <= SMALL_COMPLETE_READ_MAX_BYTES) {
           markCompleteFileBytes(db, node.inode);
+          noteCompleteSmallFileRead(db, canonical, node.inode, node.size);
         }
       },
     },
