@@ -80,6 +80,74 @@ describe("addWith", () => {
     expect(await statusOf("changed.txt")).toEqual([1, 2, 2]);
   });
 
+  it("stages a same-size overwrite when whole-second stat data matches the index", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-17T12:00:00.250Z"));
+    try {
+      const path = `${DIR}/racy.txt`;
+      const timestamp = new Date("2026-08-17T12:00:00.250Z");
+      await init();
+      await memfs.promises.writeFile(path, "alpha\n");
+      await memfs.promises.utimes(path, timestamp, timestamp);
+      const indexedStat = await memfs.promises.stat(path);
+      await stage(["racy.txt"]);
+      await git.commit({ fs: memfs, dir: DIR, message: "init", author: AUTHOR });
+
+      await memfs.promises.writeFile(path, "bravo\n");
+      await memfs.promises.utimes(path, timestamp, timestamp);
+      const overwrittenStat = await memfs.promises.stat(path);
+
+      expect(overwrittenStat.size).toBe(indexedStat.size);
+      expect(Math.floor(overwrittenStat.mtime.getTime() / 1000)).toBe(
+        Math.floor(indexedStat.mtime.getTime() / 1000),
+      );
+      expect(Math.floor(overwrittenStat.ctime.getTime() / 1000)).toBe(
+        Math.floor(indexedStat.ctime.getTime() / 1000),
+      );
+      expect(await statusOf("racy.txt")).toEqual([1, 1, 1]);
+
+      await stage(["racy.txt"]);
+
+      expect(await statusOf("racy.txt")).toEqual([1, 2, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not reread a tracked file already equal to the index", async () => {
+    await init();
+    await memfs.promises.writeFile(`${DIR}/tracked.txt`, "tracked\n");
+    await stage(["tracked.txt"]);
+    await git.commit({ fs: memfs, dir: DIR, message: "init", author: AUTHOR });
+
+    const readFile = vi.spyOn(memfs.promises, "readFile");
+    await stage(["tracked.txt"]);
+    const contentReads = readFile.mock.calls.filter(
+      ([path]) => String(path) === `${DIR}/tracked.txt`,
+    );
+    readFile.mockRestore();
+
+    expect(await statusOf("tracked.txt")).toEqual([1, 1, 1]);
+    expect(contentReads).toHaveLength(0);
+  });
+
+  it("does not reread an untracked file already equal to the index", async () => {
+    await init();
+    await memfs.promises.writeFile(`${DIR}/untracked.txt`, "untracked\n");
+    await stage(["untracked.txt"]);
+    expect(await statusOf("untracked.txt")).toEqual([0, 2, 2]);
+
+    const readFile = vi.spyOn(memfs.promises, "readFile");
+    await stage(["untracked.txt"]);
+    const contentReads = readFile.mock.calls.filter(
+      ([path]) => String(path) === `${DIR}/untracked.txt`,
+    );
+    readFile.mockRestore();
+
+    expect(await statusOf("untracked.txt")).toEqual([0, 2, 2]);
+    expect(contentReads).toHaveLength(0);
+  });
+
   it("does not read unchanged files below an explicit directory pathspec", async () => {
     await init();
     await memfs.promises.mkdir(`${DIR}/src`, { recursive: true });
