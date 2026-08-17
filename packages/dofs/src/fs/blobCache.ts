@@ -29,6 +29,7 @@ import { type Database, databaseCoreKey } from "../storage.js";
 const CHUNK_CACHE_MAX_ENTRIES = 16;
 
 const caches = new WeakMap<object, Map<string, Uint8Array>>();
+const completeFiles = new WeakMap<object, Map<number, true>>();
 
 function cacheFor(db: Database): Map<string, Uint8Array> {
   const key = databaseCoreKey(db);
@@ -49,6 +50,45 @@ function hashKey(hash: Uint8Array): string {
     out += String.fromCharCode(hash[i]);
   }
   return out;
+}
+
+function storeBlobBytes(db: Database, hash: Uint8Array, bytes: Uint8Array): void {
+  const cache = cacheFor(db);
+  const key = hashKey(hash);
+  cache.delete(key);
+  cache.set(key, bytes);
+  while (cache.size > CHUNK_CACHE_MAX_ENTRIES) {
+    const first = cache.keys().next();
+    if (first.done === true) break;
+    cache.delete(first.value);
+  }
+}
+
+/** Cache payload bytes already returned by another storage query. */
+export function cacheBlobBytes(db: Database, hash: Uint8Array, bytes: Uint8Array): void {
+  storeBlobBytes(db, hash, bytes);
+}
+
+/** Report whether a complete read has primed this inode's payload cache. */
+export function hasCompleteFileBytes(db: Database, inode: number): boolean {
+  return completeFiles.get(databaseCoreKey(db))?.has(inode) === true;
+}
+
+/** Record that a complete read populated every payload for this inode. */
+export function markCompleteFileBytes(db: Database, inode: number): void {
+  const key = databaseCoreKey(db);
+  let inodes = completeFiles.get(key);
+  if (inodes === undefined) {
+    inodes = new Map();
+    completeFiles.set(key, inodes);
+  }
+  inodes.delete(inode);
+  inodes.set(inode, true);
+  while (inodes.size > CHUNK_CACHE_MAX_ENTRIES) {
+    const first = inodes.keys().next();
+    if (first.done === true) break;
+    inodes.delete(first.value);
+  }
 }
 
 // Look up blob bytes by hash. Cache hit returns the cached
@@ -72,17 +112,14 @@ export function getBlobBytes(db: Database, hash: Uint8Array): Uint8Array | undef
     hash,
   );
   if (row === undefined) return undefined;
-  cache.set(key, row.bytes);
-  while (cache.size > CHUNK_CACHE_MAX_ENTRIES) {
-    const first = cache.keys().next();
-    if (first.done === true) break;
-    cache.delete(first.value);
-  }
+  storeBlobBytes(db, hash, row.bytes);
   return row.bytes;
 }
 
 // Reset the cache for `db`. Tests use this to keep cache state from
 // leaking between cases that share a Database constructor pattern.
 export function clearBlobCache(db: Database): void {
-  caches.delete(databaseCoreKey(db));
+  const key = databaseCoreKey(db);
+  caches.delete(key);
+  completeFiles.delete(key);
 }

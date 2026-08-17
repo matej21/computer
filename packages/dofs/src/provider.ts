@@ -8,13 +8,12 @@
 // I/O, truncate, symlinks, watch).
 
 import { createWorkspaceError } from "./errors.js";
-import { getBlobBytes } from "./fs/blobCache.js";
 import { link as linkImpl } from "./fs/link.js";
 import type { MkdirOptions } from "./fs/mkdir.js";
 import { mkdir as mkdirImpl } from "./fs/mkdir.js";
 import { findPendingWriteBuffer } from "./fs/pendingWriteBuffer.js";
 import { readdir as readdirImpl } from "./fs/readdir.js";
-import { readRangeSync as readRangeSyncImpl } from "./fs/readFile.js";
+import { readRangeSync as readRangeSyncImpl, readWholeFileBytes } from "./fs/readFile.js";
 import { readlink as readlinkImpl } from "./fs/readlink.js";
 import { rename as renameImpl } from "./fs/rename.js";
 import { resolveInode } from "./fs/resolve.js";
@@ -413,22 +412,8 @@ export class SQLiteWorkspaceProvider {
       snapshot.set(buffered.buf.subarray(0, buffered.size));
       return encoding ? snapshot.toString(encoding) : snapshot;
     }
-    const chunks = this.db.all<{ hash: Uint8Array; size: number }>(
-      "SELECT hash, size FROM vfs_chunks WHERE inode = ? ORDER BY idx",
-      node.inode,
-    );
-    let total = 0;
-    for (const c of chunks) total += c.size;
-    const out = Buffer.alloc(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      const bytes = getBlobBytes(this.db, chunk.hash);
-      if (bytes === undefined) {
-        throw createWorkspaceError("EIO", `missing blob bytes for ${path}`, path);
-      }
-      out.set(bytes, offset);
-      offset += bytes.byteLength;
-    }
+    const bytes = readWholeFileBytes(this.db, path, node.inode, node.size);
+    const out = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     return encoding ? out.toString(encoding) : out;
   }
 

@@ -247,6 +247,6 @@ it("benchmarks path resolution against real DO SqlStorage", async () => {
     find("exists(missing)", 16),
     readSignature(1, 318),
   );
-  expectMetricSignature("readFile(4KiB)", find("readFile(4KiB)", 8), readSignature(3, 109));
+  expectMetricSignature("readFile(4KiB)", find("readFile(4KiB)", 8), readSignature(2, 109));
   expectMetricSignature("readRange(1KiB)", find("readRange(1KiB)", 8), readSignature(3, 109));
 });
