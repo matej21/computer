@@ -1,4 +1,4 @@
-import { it } from "vitest";
+import { expect, it } from "vitest";
 import { rm } from "../fs/rm.js";
 import type { SQLiteWorkspaceProvider } from "../provider.js";
 import type { StatementCounts } from "./counting-storage.js";
@@ -30,6 +30,11 @@ it("benchmarks filesystem mutations against real DO SqlStorage", async () => {
     other: 0,
     rowsRead: 4006,
     rowsWritten: 14007,
+  };
+  const recursiveDeleteTarget = {
+    maxStatements: 16,
+    maxReadStatements: 6,
+    maxWriteStatements: 10,
   };
   results.push(recursiveDelete);
 
@@ -165,10 +170,18 @@ it("benchmarks filesystem mutations against real DO SqlStorage", async () => {
     sections: [mutationTable(results)],
     results: {
       mutations: results,
+      baselines: {
+        recursiveDelete: recursiveDeleteSignature,
+      },
+      targets: {
+        recursiveDelete: recursiveDeleteTarget,
+      },
     },
   });
 
-  expectMetricSignature(recursiveDelete.name, recursiveDelete, recursiveDeleteSignature);
+  expect(recursiveDelete.statements).toBeLessThanOrEqual(recursiveDeleteTarget.maxStatements);
+  expect(recursiveDelete.reads).toBeLessThanOrEqual(recursiveDeleteTarget.maxReadStatements);
+  expect(recursiveDelete.writes).toBeLessThanOrEqual(recursiveDeleteTarget.maxWriteStatements);
   expectMetricSignature(createBurst.name, createBurst, createBurstSignature);
   expectMetricSignature(editBurst.name, editBurst, editBurstSignature);
   expectMetricSignature(deleteBurst.name, deleteBurst, deleteBurstSignature);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Database } from "../storage.js";
+import { link } from "./link.js";
 import { mkdir } from "./mkdir.js";
 import { readdir } from "./readdir.js";
 import { readFile } from "./readFile.js";
@@ -8,7 +9,12 @@ import { resolveInode } from "./resolve.js";
 import { rm } from "./rm.js";
 import { symlink } from "./symlink.js";
 import { withDB } from "./with-db.js";
-import { writeFile } from "./writeFile.js";
+import {
+  openWriteBufferSync,
+  releaseWriteBufferSync,
+  writeFile,
+  writeRangeSync,
+} from "./writeFile.js";
 
 interface ChangeRow {
   rev: number;
@@ -236,6 +242,72 @@ describe("rm", () => {
       rm(db, "/d", { recursive: true });
       const chunkRows = db.scalar<number>("SELECT COUNT(*) FROM vfs_chunks") ?? 0;
       expect(chunkRows).toBe(0);
+    });
+  });
+
+  it("recursive keeps a file named by a hardlink outside the subtree", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/tree/inner", { recursive: true }, () => 0);
+      await writeFile(db, "/tree/inner/shared", "shared bytes", {}, () => 0);
+      await writeFile(db, "/tree/inner/only", "removed bytes", {}, () => 0);
+      link(db, "/tree/inner/shared", "/kept");
+      const sharedInode = resolveInode(db, "/kept")?.inode;
+
+      rm(db, "/tree", { recursive: true });
+
+      expect(resolveInode(db, "/tree", { followSymlinks: false })).toBeNull();
+      expect(resolveInode(db, "/kept")?.inode).toBe(sharedInode);
+      expect(await readFile(db, "/kept", "utf8")).toBe("shared bytes");
+      expect(
+        db.scalar<number>(
+          "SELECT COUNT(*) FROM vfs_chunks WHERE inode NOT IN (SELECT child_inode FROM vfs_dirents)",
+        ),
+      ).toBe(0);
+      const deletedPaths = listChanges(db)
+        .filter((row) => row.op === "delete")
+        .map((row) => row.path);
+      expect(deletedPaths).toContain("/tree/inner/shared");
+      expect(deletedPaths).not.toContain("/kept");
+    });
+  });
+
+  it("recursive keeps a live write buffer when an outside hardlink survives", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/tree", {}, () => 0);
+      await writeFile(db, "/tree/shared", "original", {}, () => 0);
+      link(db, "/tree/shared", "/kept");
+      openWriteBufferSync(db, "/kept");
+      writeRangeSync(db, "/kept", new TextEncoder().encode("updated!"), 0, {}, () => 1);
+
+      rm(db, "/tree", { recursive: true });
+      releaseWriteBufferSync(db, "/kept", () => 2);
+
+      expect(await readFile(db, "/kept", "utf8")).toBe("updated!");
+    });
+  });
+
+  it("recursive removal rolls back every table when one node delete fails", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/tree/sub", { recursive: true }, () => 0);
+      await writeFile(db, "/tree/a", "a", {}, () => 0);
+      await writeFile(db, "/tree/sub/b", "b", {}, () => 0);
+      const blockedInode = resolveInode(db, "/tree/sub/b")?.inode;
+      if (blockedInode === undefined) throw new Error("fixture inode is missing");
+      db.run(`CREATE TRIGGER fail_recursive_rm
+        BEFORE DELETE ON vfs_nodes
+        WHEN OLD.inode = ${blockedInode}
+        BEGIN
+          SELECT RAISE(ABORT, 'stop recursive rm');
+        END`);
+      const beforeRev = db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'");
+      const beforeChanges = listChanges(db);
+
+      expect(() => rm(db, "/tree", { recursive: true })).toThrow("stop recursive rm");
+
+      expect(await readFile(db, "/tree/a", "utf8")).toBe("a");
+      expect(await readFile(db, "/tree/sub/b", "utf8")).toBe("b");
+      expect(db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'")).toBe(beforeRev);
+      expect(listChanges(db)).toEqual(beforeChanges);
     });
   });
 
