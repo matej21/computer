@@ -4,8 +4,13 @@ import { CountingStorage } from "../bench/counting-storage.js";
 import type * as publicApi from "../index.js";
 import { initializeSchema } from "../schema/index.js";
 import { Database, type Database as DatabaseType, isDatabaseOperationView } from "../storage.js";
+import { coalesceChanges } from "../sync/coalesce.js";
+import { hasObjects } from "../sync/fetch.js";
+import { buildManifest } from "../sync/manifests.js";
+import { currentRev, writeWatermark } from "../sync/watermarks.js";
 import { SQLiteTestStorage } from "../testing.js";
 import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "../types.js";
+import { ls } from "./ls.js";
 import { mkdir } from "./mkdir.js";
 import { readdir } from "./readdir.js";
 import { readFile } from "./readFile.js";
@@ -17,7 +22,7 @@ import {
   flushWriteBatchSync,
   withWriteBatchSync,
 } from "./writeBatch.js";
-import { writeFileSync } from "./writeFile.js";
+import { chunksOf, writeFileSync } from "./writeFile.js";
 
 const NOW = (): number => 1000;
 const encoder = new TextEncoder();
@@ -127,6 +132,16 @@ function jsonArrayLength(value: unknown): number {
   return decoded.length;
 }
 
+function jsonBindingByteLengths(storage: InspectingStorage): number[] {
+  return storage.statements.flatMap((statement) =>
+    statement.query.includes("INSERT INTO vfs_") && statement.query.includes("json_each")
+      ? statement.bindings.flatMap((binding) =>
+          typeof binding === "string" ? [encoder.encode(binding).byteLength] : [],
+        )
+      : [],
+  );
+}
+
 const THEN_METHOD = "then";
 
 class ProbeThenable implements PromiseLike<string> {
@@ -149,6 +164,7 @@ describe("synchronous write batches", () => {
       maxBytes: 4 * 1024 * 1024,
       maxFiles: 1024,
       maxBlobRowsPerStatement: 50,
+      maxMetadataPageBytes: 1024 * 1024,
     });
 
     await withDB(async (db) => {
@@ -197,6 +213,20 @@ describe("synchronous write batches", () => {
           writeText(batchDb, "/ready/a.txt", "a");
           writeText(batchDb, "/ready/b.txt", "b");
           expect(childCount(batchDb, parentInode)).toBe(0);
+          expect(
+            batchDb.all<{ name: string }>(
+              "SELECT name FROM vfs_dirents WHERE parent_inode = ? ORDER BY name",
+              parentInode,
+            ),
+          ).toEqual([]);
+          expect(
+            batchDb.sql
+              .exec<{ name: string }>(
+                "SELECT name FROM vfs_dirents WHERE parent_inode = ? ORDER BY name",
+                parentInode,
+              )
+              .toArray(),
+          ).toEqual([]);
           expect(childCount(db, parentInode)).toBe(0);
 
           flushWriteBatchSync(batchDb);
@@ -309,6 +339,79 @@ describe("synchronous write batches", () => {
             .sort(),
         ).toEqual(["a.txt", "b.txt", "c.txt"]);
         expect(childCount(db, parentInode)).toBe(3);
+      });
+    });
+  });
+
+  it.each([
+    {
+      name: "flat listings",
+      read: (db: DatabaseType, beforeRev: number, hash: Uint8Array): void => {
+        expect(ls(db, "/ready")).toEqual(["/ready/file.txt"]);
+        expect(beforeRev).toBeGreaterThan(0);
+        expect(hash.byteLength).toBeGreaterThan(0);
+      },
+    },
+    {
+      name: "change streams",
+      read: (db: DatabaseType, beforeRev: number, hash: Uint8Array): void => {
+        void coalesceChanges(db, { rev: beforeRev, path: null })[Symbol.asyncIterator]().next();
+        expect(hash.byteLength).toBeGreaterThan(0);
+      },
+    },
+    {
+      name: "current revision reads",
+      read: (db: DatabaseType, beforeRev: number, hash: Uint8Array): void => {
+        expect(currentRev(db)).toBe(beforeRev + 1);
+        expect(hash.byteLength).toBeGreaterThan(0);
+      },
+    },
+    {
+      name: "object presence probes",
+      read: (db: DatabaseType, beforeRev: number, hash: Uint8Array): void => {
+        expect(hasObjects(db, [hash])).toEqual([hash]);
+        expect(beforeRev).toBeGreaterThan(0);
+      },
+    },
+  ])("flushes staged creates before $name", async ({ read }) => {
+    await withDB(async (db) => {
+      const parentInode = prepareDirectory(db);
+      const beforeRev = currentRev(db);
+      const bytes = encoder.encode("content");
+      const hash = chunksOf(bytes)[0]?.hash;
+      if (hash === undefined) throw new Error("fixture chunk is missing");
+
+      withWriteBatchSync(db, (batchDb: DatabaseType) => {
+        writeFileSync(batchDb, "/ready/file.txt", bytes, {}, NOW);
+        expect(childCount(batchDb, parentInode)).toBe(0);
+        read(batchDb, beforeRev, hash);
+        expect(childCount(batchDb, parentInode)).toBe(1);
+      });
+    });
+  });
+
+  it.each([
+    {
+      name: "manifest writes",
+      mutate: (db: DatabaseType): void => {
+        buildManifest(db, [], NOW());
+      },
+    },
+    {
+      name: "watermark writes",
+      mutate: (db: DatabaseType): void => {
+        writeWatermark(db, "pushRev", 7);
+      },
+    },
+  ])("flushes staged creates before $name", async ({ mutate }) => {
+    await withDB(async (db) => {
+      const parentInode = prepareDirectory(db);
+
+      withWriteBatchSync(db, (batchDb: DatabaseType) => {
+        writeText(batchDb, "/ready/file.txt", "content");
+        expect(childCount(batchDb, parentInode)).toBe(0);
+        mutate(batchDb);
+        expect(childCount(batchDb, parentInode)).toBe(1);
       });
     });
   });
@@ -427,6 +530,52 @@ describe("synchronous write batches", () => {
           table,
         ).toEqual([2, 2, 1]);
       }
+    });
+  });
+
+  it("caps every metadata JSON page by configurable encoded bytes", async () => {
+    await withInspectingDatabase((db, storage) => {
+      prepareDirectory(db);
+      storage.reset();
+      const maxMetadataPageBytes = 512;
+
+      withWriteBatchSync(
+        db,
+        (batchDb: DatabaseType) => {
+          for (let index = 0; index < 24; index += 1) {
+            const name = `${String(index).padStart(2, "0")}-${"n".repeat(160)}`;
+            writeText(batchDb, `/ready/${name}`, "");
+          }
+        },
+        { maxMetadataPageBytes },
+      );
+
+      const pageBytes = jsonBindingByteLengths(storage);
+      expect(pageBytes.length).toBeGreaterThan(3);
+      expect(Math.max(...pageBytes)).toBeLessThanOrEqual(maxMetadataPageBytes);
+    });
+  });
+
+  it("clamps the metadata JSON page byte option to its hard bound", async () => {
+    await withInspectingDatabase((db, storage) => {
+      prepareDirectory(db);
+      storage.reset();
+      const hardMaxMetadataPageBytes = DEFAULT_WRITE_BATCH_LIMITS.maxMetadataPageBytes;
+
+      withWriteBatchSync(
+        db,
+        (batchDb: DatabaseType) => {
+          for (let index = 0; index < 40; index += 1) {
+            const name = `${String(index).padStart(2, "0")}-${"n".repeat(32 * 1024)}`;
+            writeText(batchDb, `/ready/${name}`, "");
+          }
+        },
+        { maxMetadataPageBytes: Number.MAX_SAFE_INTEGER },
+      );
+
+      const pageBytes = jsonBindingByteLengths(storage);
+      expect(pageBytes.length).toBeGreaterThan(0);
+      expect(Math.max(...pageBytes)).toBeLessThanOrEqual(hardMaxMetadataPageBytes);
     });
   });
 
