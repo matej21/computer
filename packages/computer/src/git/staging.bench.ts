@@ -39,7 +39,7 @@ async function stage(): Promise<void> {
 
 beforeEach(() => vol.reset());
 
-test("explicit staging reads file contents in proportion to changed paths", async () => {
+test("explicit staging reads contents and extra metadata in proportion to changed paths", async () => {
   const sourceDirectory = `${SCENARIO.directory}/${SCENARIO.pathspec}`;
   await memfs.promises.mkdir(sourceDirectory, { recursive: true });
   for (let index = 0; index < SCENARIO.fixtureFiles; index++) {
@@ -58,14 +58,38 @@ test("explicit staging reads file contents in proportion to changed paths", asyn
     await memfs.promises.writeFile(`${sourceDirectory}/file-${index}.txt`, `after ${index}\n`);
   }
 
+  const baselineLstat = vi.spyOn(memfs.promises, "lstat");
+  const baselineStat = vi.spyOn(memfs.promises, "stat");
+  await git.statusMatrix({
+    fs: memfs,
+    dir: SCENARIO.directory,
+    filepaths: [SCENARIO.pathspec],
+  });
+  const baselineLstatOperations = baselineLstat.mock.calls.length;
+  const baselineStatOperations = baselineStat.mock.calls.length;
+  baselineLstat.mockRestore();
+  baselineStat.mockRestore();
+
   const readFile = vi.spyOn(memfs.promises, "readFile");
+  const lstat = vi.spyOn(memfs.promises, "lstat");
+  const stat = vi.spyOn(memfs.promises, "stat");
   const startedAt = performance.now();
   await stage();
   const elapsedMs = performance.now() - startedAt;
   const worktreeReads = readFile.mock.calls
     .map(([path]) => String(path))
     .filter((path) => path.startsWith(`${sourceDirectory}/`));
+  const stagingLstatOperations = lstat.mock.calls.length;
+  const stagingStatOperations = stat.mock.calls.length;
+  const worktreeLstatOperations = lstat.mock.calls.filter(([path]) =>
+    String(path).startsWith(`${sourceDirectory}/`),
+  ).length;
+  const worktreeStatOperations = stat.mock.calls.filter(([path]) =>
+    String(path).startsWith(`${sourceDirectory}/`),
+  ).length;
   readFile.mockRestore();
+  lstat.mockRestore();
+  stat.mockRestore();
 
   const contentFilesRead = [...new Set(worktreeReads)].filter((path) =>
     /\/file-\d+\.txt$/.test(path),
@@ -75,6 +99,10 @@ test("explicit staging reads file contents in proportion to changed paths", asyn
     return match !== null && Number(match[1]) < SCENARIO.changedFiles;
   });
   const unchangedFilesRead = contentFilesRead.length - changedFilesRead.length;
+  const baselineMetadataOperations = baselineLstatOperations + baselineStatOperations;
+  const stagingMetadataOperations = stagingLstatOperations + stagingStatOperations;
+  const metadataOperationOverhead = stagingMetadataOperations - baselineMetadataOperations;
+  const metadataOperationTarget = SCENARIO.changedFiles * 4 + 2;
   const report = {
     scenario: "explicit-directory-pathspec",
     fixtureFiles: SCENARIO.fixtureFiles,
@@ -83,6 +111,14 @@ test("explicit staging reads file contents in proportion to changed paths", asyn
     contentFilesRead: contentFilesRead.length,
     changedFilesRead: changedFilesRead.length,
     unchangedFilesRead,
+    baselineLstatOperations,
+    baselineStatOperations,
+    stagingLstatOperations,
+    stagingStatOperations,
+    worktreeLstatOperations,
+    worktreeStatOperations,
+    metadataOperationOverhead,
+    metadataOperationTarget,
     elapsedMs: Number(elapsedMs.toFixed(2)),
   };
   console.log(`GIT_STAGING_BENCH ${JSON.stringify(report)}`);
@@ -97,4 +133,5 @@ test("explicit staging reads file contents in proportion to changed paths", asyn
   }
   expect(unchangedFilesRead).toBe(0);
   expect(contentFilesRead.length).toBeLessThanOrEqual(SCENARIO.changedFiles);
+  expect(metadataOperationOverhead).toBeLessThanOrEqual(metadataOperationTarget);
 });
