@@ -16,25 +16,26 @@
 // and clears this cache afterward so a stale payload is never served
 // after a repair.
 //
-// The cache is bounded (CHUNK_CACHE_MAX_ENTRIES) and per-Database so
-// independent test databases don't pollute each other. Eviction is
+// The cache is bounded (CHUNK_CACHE_MAX_ENTRIES) and per database core so
+// root and operation views share payloads. Eviction is
 // LRU; access moves an entry to the most-recent position.
 
-import type { Database } from "../storage.js";
+import { type Database, databaseCoreKey } from "../storage.js";
 
-// Number of distinct blob payloads kept in memory per Database.
+// Number of distinct blob payloads kept in memory per database core.
 // At 512 KiB per blob this caps the cache at ~8 MiB, large enough
 // to hold a handful of hot chunks for sequential reads of large
 // files without dominating process memory.
 const CHUNK_CACHE_MAX_ENTRIES = 16;
 
-const caches = new WeakMap<Database, Map<string, Uint8Array>>();
+const caches = new WeakMap<object, Map<string, Uint8Array>>();
 
 function cacheFor(db: Database): Map<string, Uint8Array> {
-  let cache = caches.get(db);
+  const key = databaseCoreKey(db);
+  let cache = caches.get(key);
   if (cache === undefined) {
     cache = new Map();
-    caches.set(db, cache);
+    caches.set(key, cache);
   }
   return cache;
 }
@@ -83,5 +84,5 @@ export function getBlobBytes(db: Database, hash: Uint8Array): Uint8Array | undef
 // Reset the cache for `db`. Tests use this to keep cache state from
 // leaking between cases that share a Database constructor pattern.
 export function clearBlobCache(db: Database): void {
-  caches.delete(db);
+  caches.delete(databaseCoreKey(db));
 }

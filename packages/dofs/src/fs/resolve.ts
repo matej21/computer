@@ -2,7 +2,12 @@ import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import { ROOT_INODE } from "../schema/index.js";
 import type { Database } from "../storage.js";
-import { lookupResolveCache, storeResolveCache } from "./resolveCache.js";
+import {
+  lookupOperationNodeCache,
+  lookupResolveCache,
+  storeOperationNodeCache,
+  storeResolveCache,
+} from "./resolveCache.js";
 
 export interface ResolvedInode {
   inode: number;
@@ -87,8 +92,20 @@ export function resolveInode(
     if (hit.kind === "negative") {
       return null;
     }
+    const cachedNode = lookupOperationNodeCache(db, hit.inode);
+    if (cachedNode !== undefined) {
+      return {
+        inode: cachedNode.inode,
+        type: cachedNode.type,
+        mode: cachedNode.mode,
+        mtime: cachedNode.mtime,
+        size: cachedNode.size,
+        linkTarget: cachedNode.linkTarget,
+      };
+    }
     const node = readNode(db, hit.inode);
     if (node !== null) {
+      storeResolvedNode(db, toResolved(node));
       return toResolved(node);
     }
   }
@@ -103,7 +120,20 @@ export function resolveInode(
     return resolveParts(db, parts, followFinal, 0);
   }
   storeResolveCache(db, canonical, cte.node === null ? null : cte.node.inode);
+  if (cte.node !== null) storeResolvedNode(db, cte.node);
   return cte.node;
+}
+
+function storeResolvedNode(db: Database, node: ResolvedInode): void {
+  storeOperationNodeCache(db, {
+    kind: "resolve-node",
+    inode: node.inode,
+    type: node.type,
+    mode: node.mode,
+    mtime: node.mtime,
+    size: node.size,
+    linkTarget: node.linkTarget,
+  });
 }
 
 interface CteRow {
