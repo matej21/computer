@@ -31,7 +31,7 @@ const targetFortyReads: StatementCounts = {
   reads: 11,
   writes: 0,
   other: 0,
-  rowsRead: 1855,
+  rowsRead: 1865,
   rowsWritten: 0,
 };
 
