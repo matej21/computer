@@ -35,6 +35,57 @@ function readNumber(source: unknown, key: string): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+const DATA_OPERATIONS = new Set(["select", "insert", "update", "delete", "replace"]);
+
+function topLevelOperation(query: string): string | undefined {
+  const leading = /^[a-z]+/i.exec(query.trimStart())?.[0].toLowerCase();
+  if (leading !== "with") {
+    return leading !== undefined && DATA_OPERATIONS.has(leading) ? leading : undefined;
+  }
+  let depth = 0;
+  let quoteEnd: string | undefined;
+  let word = "";
+
+  for (let index = 0; index <= query.length; index++) {
+    const character = query[index];
+    if (quoteEnd !== undefined) {
+      if (character === quoteEnd) {
+        if (query[index + 1] === quoteEnd) {
+          index += 1;
+        } else {
+          quoteEnd = undefined;
+        }
+      }
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quoteEnd = character;
+      continue;
+    }
+    if (character === "[") {
+      quoteEnd = "]";
+      continue;
+    }
+    if (character === "(") {
+      depth += 1;
+      continue;
+    }
+    if (character === ")") {
+      depth -= 1;
+      continue;
+    }
+    if (depth === 0 && character !== undefined && /[a-z]/i.test(character)) {
+      word += character.toLowerCase();
+      continue;
+    }
+    if (word.length > 0) {
+      if (DATA_OPERATIONS.has(word)) return word;
+      word = "";
+    }
+  }
+  return undefined;
+}
+
 export class CountingStorage implements DurableObjectStorageLike {
   statements = 0;
   reads = 0;
@@ -85,15 +136,10 @@ export class CountingStorage implements DurableObjectStorageLike {
   }
 
   private classify(query: string): void {
-    const head = query.trimStart().slice(0, 6).toLowerCase();
-    if (head.startsWith("select") || head.startsWith("with")) {
+    const operation = topLevelOperation(query);
+    if (operation === "select") {
       this.reads += 1;
-    } else if (
-      head.startsWith("insert") ||
-      head.startsWith("update") ||
-      head.startsWith("delete") ||
-      head.startsWith("replac")
-    ) {
+    } else if (operation !== undefined) {
       this.writes += 1;
     } else {
       // SAVEPOINT/RELEASE/PRAGMA/DDL etc. Not part of per-op data cost.
