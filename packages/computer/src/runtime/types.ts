@@ -2,9 +2,12 @@ import type {
   BulkPage,
   ReadFilesEntry,
   ReadFilesOptions,
+  RmFilesOptions,
   SkippedEntry,
   WalkOptions,
   WorkspaceWalkEntry,
+  WriteFilesEntry,
+  WriteFilesOptions,
 } from "@cloudflare/dofs";
 
 import type { ExecEncoding, ExecSyncResult, KillSignal } from "../shell.js";
@@ -74,7 +77,9 @@ export interface WorkspaceRuntimeFilesystem {
     content: string | Uint8Array,
     options?: { exclusive?: boolean },
   ): Promise<void>;
+  writeFiles(entries: readonly WriteFilesEntry[], options: WriteFilesOptions): Promise<void>;
   rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+  rmFiles(paths: readonly string[], options: RmFilesOptions): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
   symlink(target: string, path: string): Promise<void>;
 }

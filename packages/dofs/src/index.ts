@@ -29,8 +29,11 @@ export type {
   BulkPage,
   ReadFilesEntry,
   ReadFilesOptions,
+  RmFilesOptions,
   WalkOptions,
   WorkspaceWalkEntry,
+  WriteFilesEntry,
+  WriteFilesOptions,
 } from "./fs/publicBulk.js";
 export type { ReaddirOptions, WorkspaceDirentResult } from "./fs/readdir.js";
 export type { ReadFileOptions } from "./fs/readFile.js";

@@ -24,18 +24,23 @@ import type {
   BulkPage,
   ReadFilesEntry,
   ReadFilesOptions,
+  RmFilesOptions,
   WalkOptions,
   WorkspaceWalkEntry,
+  WriteFilesEntry,
+  WriteFilesOptions,
 } from "./publicBulk.js";
 import { type ReaddirOptions, readdir, type WorkspaceDirentResult } from "./readdir.js";
 import { type ReadFileOptions, readFile } from "./readFile.js";
 import { readFiles } from "./readFiles.js";
 import { readlink } from "./readlink.js";
 import { type RmOptions, rm } from "./rm.js";
+import { rmFiles } from "./rmFiles.js";
 import { lstat, stat, type WorkspaceStatResult } from "./stat.js";
 import { symlink } from "./symlink.js";
 import { walk } from "./walk.js";
 import { type WriteFileContent, type WriteFileOptions, writeFile } from "./writeFile.js";
+import { writeFiles } from "./writeFiles.js";
 
 export interface WorkspaceFilesystemOptions {
   // Clock used for mtime / last_seen. Defaults to Date.now.
@@ -134,12 +139,20 @@ export class WorkspaceFilesystem {
     return writeFile(this.db, path, content, options, this.now);
   }
 
+  writeFiles(entries: readonly WriteFilesEntry[], options: WriteFilesOptions): Promise<void> {
+    return writeFiles(this.db, entries, options, this.now);
+  }
+
   async mkdir(path: string, options: MkdirOptions = {}): Promise<void> {
     mkdir(this.db, path, options, this.now);
   }
 
   async rm(path: string, options: RmOptions = {}): Promise<void> {
     rm(this.db, path, options);
+  }
+
+  async rmFiles(paths: readonly string[], options: RmFilesOptions): Promise<void> {
+    rmFiles(this.db, paths, options);
   }
 
   // Change the permission bits on a path. Follows symlinks like
