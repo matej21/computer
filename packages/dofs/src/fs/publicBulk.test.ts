@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { SQLiteWorkspaceProvider } from "../provider.js";
 import { clearBlobCache } from "./blobCache.js";
 import { WorkspaceFilesystem } from "./filesystem.js";
 import { link } from "./link.js";
@@ -152,6 +153,27 @@ describe("public bounded bulk filesystem", () => {
     });
   });
 
+  it("validates a walk cursor root inode against the requested directory", async () => {
+    await withFs(async (fs) => {
+      await fs.mkdir("/tree", { recursive: true });
+      await fs.mkdir("/other", { recursive: true });
+      await fs.writeFile("/tree/a", "a");
+      await fs.writeFile("/tree/b", "b");
+      await fs.writeFile("/other/z-secret", "secret");
+      const options = { limit: 1, maxBytes: WALK_MAX_BYTES };
+      const first = await fs.walk("/tree", options);
+      if (first.cursor === undefined) throw new Error("walk cursor is missing");
+      const other = await fs.stat("/other");
+      const cursorParts = first.cursor.split(":");
+      if (cursorParts.length !== 6) throw new Error("unexpected walk cursor shape");
+      cursorParts[2] = other.inode.toString(36);
+
+      await expect(
+        fs.walk("/tree", { ...options, cursor: cursorParts.join(":") }),
+      ).rejects.toMatchObject({ code: "EINVAL", path: "/tree" });
+    });
+  });
+
   it("enforces walk depth, serialized byte pages, and hard ceilings", async () => {
     await withFs(async (fs) => {
       await fs.mkdir("/tree/deep", { recursive: true });
@@ -196,6 +218,40 @@ describe("public bounded bulk filesystem", () => {
           exclude: ["x".repeat(WALK_MAX_EXCLUDE_BYTES)],
         }),
       ).resolves.toEqual(expect.objectContaining({ entries: expect.any(Array) }));
+    });
+  });
+
+  it("returns no descendants when walk depth is zero", async () => {
+    await withFs(async (fs) => {
+      await fs.mkdir("/tree/deep", { recursive: true });
+      await fs.writeFile("/tree/file", "file");
+      await fs.writeFile("/tree/deep/file", "deep");
+
+      await expect(
+        fs.walk("/tree", { limit: 1000, maxBytes: WALK_MAX_BYTES, depth: 0 }),
+      ).resolves.toEqual({ entries: [] });
+    });
+  });
+
+  it("includes pending creates in walk with their current metadata", async () => {
+    await withFs(async (fs) => {
+      await fs.mkdir("/tree", { recursive: true });
+      const provider = new SQLiteWorkspaceProvider(fs.db, { now: () => 1000 });
+      provider.openWriteBufferForCreateSync("/tree/pending", { mode: 0o600 });
+      provider.writeRangeSync("/tree/pending", "pending", 0);
+
+      await expect(fs.walk("/tree", { limit: 1000, maxBytes: WALK_MAX_BYTES })).resolves.toEqual({
+        entries: [
+          {
+            path: "/tree/pending",
+            inode: 0,
+            type: "file",
+            mode: 0o600,
+            mtime: 1000,
+            size: 7,
+          },
+        ],
+      });
     });
   });
 
@@ -348,6 +404,36 @@ describe("public bounded bulk filesystem", () => {
       expect(decode(page.entries[1]?.content)).toBe("original");
       expect(decode(page.entries[2]?.content)).toBe("original");
       await expect(fs.readFile("/original", "utf8")).resolves.toBe("original");
+    });
+  });
+
+  it("budgets readFiles from the current dirty buffer size", async () => {
+    await withFs(async (fs) => {
+      await fs.writeFile("/exact", "x");
+      await fs.writeFile("/over", "x");
+      const provider = new SQLiteWorkspaceProvider(fs.db, { now: () => 1000 });
+      provider.openWriteBufferSync("/exact");
+      provider.openWriteBufferSync("/over");
+      provider.writeRangeSync("/exact", "exact", 0);
+      provider.writeRangeSync("/over", "large!", 0);
+
+      const exact = await fs.readFiles(["/exact"], { limit: 1, maxBytes: 5 });
+      expect(decode(exact.entries[0]?.content)).toBe("exact");
+      expect(exact.cursor).toBeUndefined();
+
+      const over = await fs.readFiles(["/over"], { limit: 1, maxBytes: 5 });
+      expect(over).toEqual({
+        entries: [
+          {
+            path: "/over",
+            error: {
+              code: "EFBIG",
+              message: expect.any(String),
+              path: "/over",
+            },
+          },
+        ],
+      });
     });
   });
 
