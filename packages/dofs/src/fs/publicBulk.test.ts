@@ -836,6 +836,34 @@ describe("public bounded bulk filesystem", () => {
     });
   });
 
+  it("splits destination hardlinks for distinct source files", async () => {
+    await withFs(async (fs) => {
+      await fs.mkdir("/source", { recursive: true });
+      await fs.writeFile("/source/a", "alpha");
+      await fs.writeFile("/source/b", "bravo");
+      await fs.mkdir("/dest", { recursive: true });
+      await fs.writeFile("/dest/a", "old");
+      link(fs.db, "/dest/a", "/dest/b");
+      const beforeRev = fs.db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'") ?? 0;
+
+      await fs.cp("/source", "/dest", { recursive: true });
+
+      const afterRev = fs.db.scalar<number>("SELECT v FROM vfs_meta WHERE k = 'rev'") ?? 0;
+      const copiedA = await fs.stat("/dest/a");
+      const copiedB = await fs.stat("/dest/b");
+      expect(afterRev).toBe(beforeRev + 1);
+      await expect(fs.readFile("/dest/a", "utf8")).resolves.toBe("alpha");
+      await expect(fs.readFile("/dest/b", "utf8")).resolves.toBe("bravo");
+      expect(copiedA.inode).not.toBe(copiedB.inode);
+      expect(fs.db.scalar<number>("SELECT rev FROM vfs_nodes WHERE inode = ?", copiedA.inode)).toBe(
+        afterRev,
+      );
+      expect(fs.db.scalar<number>("SELECT rev FROM vfs_nodes WHERE inode = ?", copiedB.inode)).toBe(
+        afterRev,
+      );
+    });
+  });
+
   it("copies files and symlinks with explicit metadata and destination semantics", async () => {
     await withFs(async (fs) => {
       await fs.writeFile("/file", "file", { mode: 0o600 });
