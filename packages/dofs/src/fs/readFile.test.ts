@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { SQLiteWorkspaceProvider } from "../provider.js";
+import type { Database } from "../storage.js";
 import { clearBlobCache } from "./blobCache.js";
 import { mkdir } from "./mkdir.js";
 import { readFile } from "./readFile.js";
@@ -31,6 +33,29 @@ async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
     offset += part.byteLength;
   }
   return out;
+}
+
+function recordQueries(db: Database): { queries: string[]; stop: () => void } {
+  const queries: string[] = [];
+  const originalExec = db.sql.exec.bind(db.sql);
+  db.sql.exec = <Row extends object = Record<string, unknown>>(
+    query: string,
+    ...bindings: unknown[]
+  ) => {
+    queries.push(query);
+    return originalExec<Row>(query, ...bindings);
+  };
+  return {
+    queries,
+    stop: () => {
+      db.sql.exec = originalExec;
+    },
+  };
+}
+
+function readsBlobPayload(query: string): boolean {
+  const normalized = query.trimStart().toLowerCase();
+  return normalized.startsWith("select") && normalized.includes("vfs_blob_bytes");
 }
 
 describe("readFile", () => {
@@ -75,6 +100,60 @@ describe("readFile", () => {
       await expect(readFile(db, "/small.txt", "utf8")).rejects.toMatchObject({ code: "EIO" });
       const stream = await readFile(db, "/small.txt");
       await expect(drain(stream)).rejects.toMatchObject({ code: "EIO" });
+    });
+  });
+
+  it("shares a cached small complete read with repeated, ranged, and provider reads", async () => {
+    await withDB(async (db) => {
+      const content = "hello shared cache";
+      await writeFile(db, "/small.txt", content, {}, () => 0);
+      clearBlobCache(db);
+
+      expect(await readFile(db, "/small.txt", "utf8")).toBe(content);
+      db.run("DELETE FROM vfs_blob_bytes");
+
+      expect(await readFile(db, "/small.txt", "utf8")).toBe(content);
+      const range = await readFile(db, "/small.txt", { byteOffset: 6, byteLength: 6 });
+      expect(new TextDecoder().decode(await drain(range))).toBe("shared");
+      const provider = new SQLiteWorkspaceProvider(db, { now: () => 0 });
+      expect(provider.readFileSync("/small.txt", "utf8")).toBe(content);
+    });
+  });
+
+  it("shares a provider complete read with filesystem reads", async () => {
+    await withDB(async (db) => {
+      const content = "provider shared cache";
+      await writeFile(db, "/small.txt", content, {}, () => 0);
+      clearBlobCache(db);
+      const provider = new SQLiteWorkspaceProvider(db, { now: () => 0 });
+
+      expect(provider.readFileSync("/small.txt", "utf8")).toBe(content);
+      db.run("DELETE FROM vfs_blob_bytes");
+
+      expect(await readFile(db, "/small.txt", "utf8")).toBe(content);
+      const range = await readFile(db, "/small.txt", { byteOffset: 0, byteLength: 8 });
+      expect(new TextDecoder().decode(await drain(range))).toBe("provider");
+    });
+  });
+
+  it("does not fetch blob payload until a default binary stream is pulled", async () => {
+    await withDB(async (db) => {
+      const content = "lazy stream payload";
+      await writeFile(db, "/small.txt", content, {}, () => 0);
+      clearBlobCache(db);
+      const recording = recordQueries(db);
+      try {
+        const stream = await readFile(db, "/small.txt");
+        const openQueries = recording.queries.splice(0);
+        const bytes = await drain(stream);
+        const pullQueries = recording.queries.splice(0);
+
+        expect(new TextDecoder().decode(bytes)).toBe(content);
+        expect.soft(openQueries.filter(readsBlobPayload)).toEqual([]);
+        expect.soft(pullQueries.filter(readsBlobPayload)).toHaveLength(1);
+      } finally {
+        recording.stop();
+      }
     });
   });
 

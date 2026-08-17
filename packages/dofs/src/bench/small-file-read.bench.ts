@@ -30,6 +30,15 @@ const targetSmallCompleteRead: StatementCounts = {
   rowsWritten: 0,
 };
 
+const targetWarmCachedRead: StatementCounts = {
+  statements: 2,
+  reads: 2,
+  writes: 0,
+  other: 0,
+  rowsRead: 10,
+  rowsWritten: 0,
+};
+
 function resetReadCaches(db: Database): void {
   clearResolveCache(db);
   clearBlobCache(db);
@@ -60,6 +69,41 @@ async function benchAsyncRead(options: {
     resetReadCaches(db);
     counting.reset();
     await op(db);
+    return counting.snapshot();
+  });
+  return { name, depth: 1, nsPerOp, ...counts };
+}
+
+async function benchWarmRead(options: {
+  name: string;
+  content: string;
+  prime: (db: Database, provider: SQLiteWorkspaceProvider) => Promise<void>;
+  op: (db: Database, provider: SQLiteWorkspaceProvider) => Promise<void>;
+}): Promise<ReadBenchmarkResult> {
+  const { name, content, prime, op } = options;
+  const path = "/file.txt";
+  const nsPerOp = await withRealDb(async (db, provider) => {
+    provider.writeFileSync(path, content);
+    resetReadCaches(db);
+    await prime(db, provider);
+    for (let index = 0; index < 200; index++) {
+      clearResolveCache(db);
+      await op(db, provider);
+    }
+    const start = performance.now();
+    for (let index = 0; index < ITERATIONS; index++) {
+      clearResolveCache(db);
+      await op(db, provider);
+    }
+    return ((performance.now() - start) * 1e6) / ITERATIONS;
+  });
+  const counts = await withCountingDb(async (db, provider, counting) => {
+    provider.writeFileSync(path, content);
+    resetReadCaches(db);
+    await prime(db, provider);
+    clearResolveCache(db);
+    counting.reset();
+    await op(db, provider);
     return counting.snapshot();
   });
   return { name, depth: 1, nsPerOp, ...counts };
@@ -123,12 +167,45 @@ it("benchmarks complete small-file reads against real DO SqlStorage", async () =
     },
     iterations: ITERATIONS,
   });
+  const repeatedComplete = await benchWarmRead({
+    name: "fs.complete->complete(4KiB)",
+    content: fourKiB,
+    prime: async (db) => {
+      await readFile(db, "/file.txt", "utf8");
+    },
+    op: async (db) => {
+      await readFile(db, "/file.txt", "utf8");
+    },
+  });
+  const completeThenRange = await benchWarmRead({
+    name: "fs.complete->provider.range(4KiB)",
+    content: fourKiB,
+    prime: async (db) => {
+      await readFile(db, "/file.txt", "utf8");
+    },
+    op: async (_db, provider) => {
+      provider.readRangeSync("/file.txt", 0, 1024);
+    },
+  });
+  const providerThenComplete = await benchWarmRead({
+    name: "provider.complete->fs.complete(4KiB)",
+    content: fourKiB,
+    prime: async (_db, provider) => {
+      provider.readFileSync("/file.txt", "utf8");
+    },
+    op: async (db) => {
+      await readFile(db, "/file.txt", "utf8");
+    },
+  });
   const results = [
     filesystemSmall,
     providerSmall,
     providerAtThreshold,
     providerAboveThreshold,
     rangedSmall,
+    repeatedComplete,
+    completeThenRange,
+    providerThenComplete,
   ];
 
   benchmarkReport({
@@ -140,6 +217,7 @@ it("benchmarks complete small-file reads against real DO SqlStorage", async () =
       reads: results,
       baselineCompleteRead,
       targetSmallCompleteRead,
+      targetWarmCachedRead,
       smallFileMaxBytes: SMALL_FILE_MAX_BYTES,
     },
   });
@@ -149,4 +227,7 @@ it("benchmarks complete small-file reads against real DO SqlStorage", async () =
   expectMetricSignature(providerAtThreshold.name, providerAtThreshold, targetSmallCompleteRead);
   expectMetricSignature(providerAboveThreshold.name, providerAboveThreshold, baselineCompleteRead);
   expectMetricSignature(rangedSmall.name, rangedSmall, baselineCompleteRead);
+  expectMetricSignature(repeatedComplete.name, repeatedComplete, targetWarmCachedRead);
+  expectMetricSignature(completeThenRange.name, completeThenRange, targetWarmCachedRead);
+  expectMetricSignature(providerThenComplete.name, providerThenComplete, targetWarmCachedRead);
 });
