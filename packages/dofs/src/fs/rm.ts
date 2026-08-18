@@ -41,27 +41,6 @@ export interface RemovalRoot {
   name: string;
 }
 
-const ROOT_SET_CTE = `WITH RECURSIVE
-  roots(inode, type, path, parent_inode, name) AS (
-    SELECT json_extract(value, '$[0]'),
-           json_extract(value, '$[1]'),
-           json_extract(value, '$[2]'),
-           json_extract(value, '$[3]'),
-           json_extract(value, '$[4]')
-      FROM json_each(?)
-  ),
-  subtree(inode, type, path, parent_inode, name) AS (
-    SELECT inode, type, path, parent_inode, name FROM roots
-    UNION
-    SELECT n.inode, n.type,
-           CASE WHEN s.path = '/' THEN '/' || d.name ELSE s.path || '/' || d.name END,
-           d.parent_inode, d.name
-      FROM subtree s
-      JOIN vfs_dirents d ON d.parent_inode = s.inode
-      JOIN vfs_nodes n ON n.inode = d.child_inode
-     WHERE s.type = 'dir'
-  )`;
-
 interface BufferCleanup {
   inode: number;
   entry: WriteBufferEntry;
@@ -205,61 +184,75 @@ export function removeRootSet(
   removed: readonly RemovalRoot[],
   rev: number,
 ): void {
-  const encodedRoots = JSON.stringify(
-    roots.map((root) => [root.inode, root.type, root.path, root.parentInode, root.name]),
-  );
   const removedInodes = new Set(removed.map((entry) => entry.inode));
   const removedPaths = new Set(removed.map((entry) => entry.path));
   const bufferCandidates = collectRootSetBufferCandidates(db, removedInodes, removedPaths);
+  const pages = removalPages(removed);
 
-  db.run(
-    `${ROOT_SET_CTE}
-     INSERT INTO vfs_changes (rev, path, op)
-     SELECT ?, path, 'delete' FROM subtree ORDER BY path`,
-    encodedRoots,
-    rev,
-  );
-
-  const keepExternalLinks = `AND NOT EXISTS (
-    SELECT 1
-      FROM vfs_dirents external
-     WHERE external.child_inode = target.inode
-       AND external.parent_inode NOT IN (SELECT inode FROM subtree WHERE type = 'dir')
-       AND NOT EXISTS (
-         SELECT 1 FROM roots
-          WHERE roots.inode = target.inode
-            AND roots.parent_inode = external.parent_inode
-            AND roots.name = external.name
+  for (const page of pages) {
+    db.run(
+      `WITH removed(path) AS (
+         SELECT json_extract(value, '$[1]') FROM json_each(?)
        )
-  )`;
-  db.run(
-    `${ROOT_SET_CTE}
-     DELETE FROM vfs_chunks AS target
-      WHERE target.inode IN (SELECT inode FROM subtree)
-        ${keepExternalLinks}`,
-    encodedRoots,
-  );
-  db.run(
-    `${ROOT_SET_CTE}
-     DELETE FROM vfs_nodes AS target
-      WHERE target.inode IN (SELECT inode FROM subtree)
-        ${keepExternalLinks}`,
-    encodedRoots,
-  );
-  db.run(
-    `${ROOT_SET_CTE}
-     DELETE FROM vfs_dirents
-      WHERE parent_inode IN (SELECT inode FROM subtree WHERE type = 'dir')
-         OR EXISTS (
-           SELECT 1 FROM roots
-            WHERE roots.parent_inode = vfs_dirents.parent_inode
-              AND roots.name = vfs_dirents.name
-         )`,
-    encodedRoots,
-  );
+       INSERT INTO vfs_changes (rev, path, op)
+       SELECT ?, path, 'delete' FROM removed ORDER BY path`,
+      page,
+      rev,
+    );
+  }
+  for (const page of pages) {
+    db.run(
+      `WITH removed(parent_inode, name) AS (
+         SELECT json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?)
+       )
+       DELETE FROM vfs_dirents
+        WHERE (parent_inode, name) IN (SELECT parent_inode, name FROM removed)`,
+      page,
+    );
+  }
+  for (const page of pages) {
+    db.run(
+      `WITH removed(inode) AS (
+         SELECT json_extract(value, '$[0]') FROM json_each(?)
+       )
+       DELETE FROM vfs_chunks AS target
+        WHERE target.inode IN (SELECT inode FROM removed)
+          AND NOT EXISTS (
+            SELECT 1 FROM vfs_dirents surviving WHERE surviving.child_inode = target.inode
+          )`,
+      page,
+    );
+  }
+  for (const page of pages) {
+    db.run(
+      `WITH removed(inode) AS (
+         SELECT json_extract(value, '$[0]') FROM json_each(?)
+       )
+       DELETE FROM vfs_nodes AS target
+        WHERE target.inode IN (SELECT inode FROM removed)
+          AND NOT EXISTS (
+            SELECT 1 FROM vfs_dirents surviving WHERE surviving.child_inode = target.inode
+          )`,
+      page,
+    );
+  }
 
   deferBufferCleanup(db, collectReapedBuffers(db, bufferCandidates));
   for (const root of roots) invalidateResolveSubtree(db, root.path);
+}
+
+function removalPages(removed: readonly RemovalRoot[]): string[] {
+  const pages: string[] = [];
+  for (let start = 0; start < removed.length; start += DELETE_PAGE) {
+    pages.push(
+      JSON.stringify(
+        removed
+          .slice(start, start + DELETE_PAGE)
+          .map((entry) => [entry.inode, entry.path, entry.parentInode, entry.name]),
+      ),
+    );
+  }
+  return pages;
 }
 
 function collectRootSetBufferCandidates(
