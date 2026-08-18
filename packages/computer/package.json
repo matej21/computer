@@ -114,6 +114,8 @@
     "bench:git-staging": "vitest run --config vitest.config.git-bench.ts",
     "prebench:macro:nextjs": "npm run build --workspace @cloudflare/dofs --workspace @cloudflare/computer-rpc",
     "bench:macro:nextjs": "vitest run --config vitest.config.nextjs-bench.ts --disableConsoleIntercept",
+    "prebench:macro:nextjs:legacy": "npm run build --workspace @cloudflare/dofs --workspace @cloudflare/computer-rpc",
+    "bench:macro:nextjs:legacy": "vitest run --config vitest.config.nextjs-legacy-bench.ts --disableConsoleIntercept",
     "test:harness": "./test-harness/run-harness.sh",
     "bench:harness": "./test-harness/run-harness.sh bench",
     "prepublishOnly": "npm run build && npm test"
