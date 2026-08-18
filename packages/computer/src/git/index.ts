@@ -410,7 +410,10 @@ export function createGitClient({
       return createPatchPromise;
     };
 
-    const createClient = (operationProvider: () => SQLiteWorkspaceProvider): GitClient => {
+    const createClient = (
+      operationProvider: () => SQLiteWorkspaceProvider,
+      cliTarget?: () => GitClient,
+    ): GitClient => {
       let fsPromise: Promise<IsomorphicGitFSClient> | undefined;
       const fs = () => {
         fsPromise ??= adapter(operationProvider());
@@ -720,32 +723,49 @@ export function createGitClient({
           });
         },
         async cli(input) {
-          return runGitCli(client, input, { defaultIdentity });
+          return runGitCli(cliTarget?.() ?? client, input, { defaultIdentity });
         },
       };
       return client;
     };
 
     const target = createClient(provider);
+    const overrides = new Map<PropertyKey, unknown>();
     return new Proxy(target, {
       get(_target, property) {
-        const value = Reflect.get(target, property);
+        const value = overrides.has(property)
+          ? overrides.get(property)
+          : Reflect.get(target, property);
         if (typeof value !== "function") return value;
         return (...args: unknown[]): unknown =>
           withProviderOperation(
             provider(),
             async (operationProvider) => {
               return withProviderWriteBatch(operationProvider, async (batchProvider) => {
-                const operationClient = createClient(() => batchProvider);
-                const operation = Reflect.get(operationClient, property);
+                let scopedClient: GitClient;
+                const operationClient = createClient(
+                  () => batchProvider,
+                  () => scopedClient,
+                );
+                scopedClient = new Proxy(operationClient, {
+                  get(scopedTarget, scopedProperty) {
+                    if (overrides.has(scopedProperty)) return overrides.get(scopedProperty);
+                    return Reflect.get(scopedTarget, scopedProperty);
+                  },
+                });
+                const operation = Reflect.get(scopedClient, property);
                 if (typeof operation !== "function") {
                   throw new TypeError(`Git operation ${String(property)} is not callable`);
                 }
-                return operation.apply(operationClient, args);
+                return operation.apply(scopedClient, args);
               });
             },
             gitOperationOptions(property),
           );
+      },
+      set(targetObject, property, newValue) {
+        overrides.set(property, newValue);
+        return Reflect.set(targetObject, property, newValue);
       },
     });
   };
