@@ -1,0 +1,20 @@
+{
+  "name": "computer-nextjs-macro-bench",
+  "main": "./macro-bench-worker.ts",
+  "compatibility_date": "2026-05-26",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NEXTJS_MACRO_DO",
+        "class_name": "NextjsMacroDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NextjsMacroDO"]
+    }
+  ]
+}
