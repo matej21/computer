@@ -2,14 +2,15 @@ import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import { ROOT_INODE } from "../schema/index.js";
 import type { Database } from "../storage.js";
-import { lookupCompleteDirectoryChild } from "./metadataPrefetch.js";
+import { lookupAdaptiveDirectoryChild, lookupCompleteDirectoryChild } from "./metadataPrefetch.js";
 import {
   lookupOperationNodeCache,
   lookupResolveCache,
   storeOperationNodeCache,
+  storeOperationStructuralNode,
   storeResolveCache,
 } from "./resolveCache.js";
-import { flushWriteBatchBeforeRead } from "./writeBatch.js";
+import { flushWriteBatchBeforePathRead } from "./writeBatch.js";
 
 export interface ResolvedInode {
   inode: number;
@@ -168,7 +169,7 @@ export function resolveInode(
   path: string,
   options: ResolveOptions = {},
 ): ResolvedInode | null {
-  flushWriteBatchBeforeRead(db);
+  flushWriteBatchBeforePathRead(db, path);
   const followFinal = options.followSymlinks !== false;
   const { parts, path: canonical } = canonicalizePath(path);
 
@@ -216,27 +217,11 @@ export function resolveInode(
     }
   }
 
-  const childName = parts.at(-1);
-  if (childName !== undefined) {
-    const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-    const child = lookupCompleteDirectoryChild(db, parentPath, childName);
-    if (child?.kind === "absent") {
-      storeResolveCache(db, canonical, null);
-      return null;
-    }
-    if (child?.kind === "entry" && child.entry.type !== "symlink") {
-      const node: ResolvedInode = {
-        inode: child.entry.inode,
-        type: child.entry.type,
-        mode: child.entry.mode,
-        mtime: child.entry.mtime,
-        size: child.entry.size,
-        linkTarget: child.entry.linkTarget,
-      };
-      storeResolveCache(db, canonical, node.inode);
-      storeResolvedNode(db, node);
-      return node;
-    }
+  const metadata = resolveFromMetadataDirectories(db, parts);
+  if (metadata.kind === "resolved") {
+    storeResolveCache(db, canonical, metadata.node === null ? null : metadata.node.inode);
+    if (metadata.node !== null) storeResolvedNode(db, metadata.node);
+    return metadata.node;
   }
 
   // One recursive-CTE statement resolves the common symlink-free
@@ -251,6 +236,45 @@ export function resolveInode(
   storeResolveCache(db, canonical, cte.node === null ? null : cte.node.inode);
   if (cte.node !== null) storeResolvedNode(db, cte.node);
   return cte.node;
+}
+
+type MetadataResolution = { kind: "resolved"; node: ResolvedInode | null } | { kind: "unknown" };
+
+function resolveFromMetadataDirectories(
+  db: Database,
+  parts: readonly string[],
+): MetadataResolution {
+  for (let depth = parts.length - 1; depth >= 0; depth -= 1) {
+    let parentPath = depth === 0 ? "/" : `/${parts.slice(0, depth).join("/")}`;
+    let child = lookupCompleteDirectoryChild(db, parentPath, parts[depth] ?? "");
+    if (child === undefined) continue;
+
+    for (let index = depth; index < parts.length; index += 1) {
+      if (child.kind === "absent") return { kind: "resolved", node: null };
+      if (child.entry.type === "symlink") return { kind: "unknown" };
+      if (index < parts.length - 1 && child.entry.type !== "dir") {
+        return { kind: "resolved", node: null };
+      }
+      if (index === parts.length - 1) {
+        return {
+          kind: "resolved",
+          node: {
+            inode: child.entry.inode,
+            type: child.entry.type,
+            mode: child.entry.mode,
+            mtime: child.entry.mtime,
+            size: child.entry.size,
+            linkTarget: child.entry.linkTarget,
+          },
+        };
+      }
+      const name = parts[index] ?? "";
+      parentPath = parentPath === "/" ? `/${name}` : `${parentPath}/${name}`;
+      child = lookupCompleteDirectoryChild(db, parentPath, parts[index + 1] ?? "");
+      if (child === undefined) return { kind: "unknown" };
+    }
+  }
+  return { kind: "unknown" };
 }
 
 function storeResolvedNode(db: Database, node: ResolvedInode): void {
@@ -360,6 +384,8 @@ function resolveParts(
 
   const pendingParts = [...parts];
   const nodeStack: NodeRow[] = [root];
+  const pathStack: Array<string | undefined> = ["/"];
+  storeOperationStructuralNode(db, "/", toResolved(root));
   while (pendingParts.length > 0) {
     const name = pendingParts.shift();
     if (name === undefined) continue;
@@ -367,17 +393,38 @@ function resolveParts(
     if (current.type !== "dir") return null;
     if (name === "" || name === ".") continue;
     if (name === "..") {
-      if (nodeStack.length > 1) nodeStack.pop();
+      if (nodeStack.length > 1) {
+        nodeStack.pop();
+        pathStack.pop();
+      }
       continue;
     }
 
-    const child = db.one<ChildRow>(
-      "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
-      current.inode,
-      name,
-    );
-    if (child === undefined) return null;
-    const next = readNode(db, child.child_inode);
+    const parentPath = pathStack[pathStack.length - 1];
+    const listed =
+      parentPath === undefined
+        ? undefined
+        : lookupAdaptiveDirectoryChild(db, parentPath, current.inode, name);
+    if (listed?.kind === "absent") return null;
+    let next: NodeRow | null;
+    if (listed?.kind === "entry") {
+      next = {
+        inode: listed.entry.inode,
+        type: listed.entry.type,
+        mode: listed.entry.mode,
+        mtime: listed.entry.mtime,
+        size: listed.entry.size,
+        link_target: listed.entry.linkTarget ?? null,
+      };
+    } else {
+      const child = db.one<ChildRow>(
+        "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
+        current.inode,
+        name,
+      );
+      if (child === undefined) return null;
+      next = readNode(db, child.child_inode);
+    }
     if (next === null) return null;
 
     // Intermediate symlinks always get followed; final-segment symlinks
@@ -389,20 +436,44 @@ function resolveParts(
         throw createWorkspaceError("ELOOP", "too many symlinks resolving path");
       }
       const target = next.link_target ?? "";
-      if (target.startsWith("/")) nodeStack.splice(1);
+      if (target.startsWith("/")) {
+        nodeStack.splice(1);
+        pathStack.splice(1);
+      }
+      pathStack.fill(undefined);
       pendingParts.unshift(...target.split("/"));
       continue;
     }
     nodeStack.push(next);
+    const nextPath =
+      parentPath === undefined || next.type === "symlink"
+        ? undefined
+        : parentPath === "/"
+          ? `/${name}`
+          : `${parentPath}/${name}`;
+    pathStack.push(nextPath);
+    if (nextPath !== undefined) storeOperationStructuralNode(db, nextPath, toResolved(next));
   }
 
   return toResolved(nodeStack[nodeStack.length - 1]);
 }
 
 function readNode(db: Database, inode: number): NodeRow | null {
+  const cached = lookupOperationNodeCache(db, inode);
+  if (cached !== undefined) {
+    return {
+      inode: cached.inode,
+      type: cached.type,
+      mode: cached.mode,
+      mtime: cached.mtime,
+      size: cached.size,
+      link_target: cached.linkTarget ?? null,
+    };
+  }
   const row = db.one<NodeRow>(
     "SELECT inode, type, mode, mtime, size, link_target FROM vfs_nodes WHERE inode = ?",
     inode,
   );
+  if (row !== undefined) storeResolvedNode(db, toResolved(row));
   return row ?? null;
 }

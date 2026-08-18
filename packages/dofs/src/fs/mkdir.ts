@@ -5,6 +5,7 @@ import { ROOT_INODE } from "../schema/index.js";
 import type { Database } from "../storage.js";
 import { assertNotReadOnly } from "./mount-guard.js";
 import { invalidateResolveExact } from "./resolveCache.js";
+import { stageWriteBatchMkdirSync } from "./writeBatch.js";
 
 export interface MkdirOptions {
   recursive?: boolean;
@@ -80,6 +81,7 @@ export function mkdir(db: Database, path: string, options: MkdirOptions, now: ()
     throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
   }
   assertNotReadOnly(db, canonical);
+  if (stageWriteBatchMkdirSync(db, canonical, options, now)) return;
 
   db.transactionSync(() => {
     const rev = incrementRev(db);

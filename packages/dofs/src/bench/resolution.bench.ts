@@ -222,7 +222,7 @@ it("benchmarks path resolution against real DO SqlStorage", async () => {
     expectMetricSignature(
       `provider.statSync depth=${resultDepth}`,
       providerStat,
-      readSignature(2, resolvedRows + 1),
+      readSignature(1, resolvedRows),
     );
     const flatLookup = find("flat-baseline(inode)", resultDepth);
     expectMetricSignature(`flat-baseline depth=${resultDepth}`, flatLookup, readSignature(1, 1));

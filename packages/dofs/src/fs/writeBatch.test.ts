@@ -2,6 +2,8 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { CountingStorage } from "../bench/counting-storage.js";
 import type * as publicApi from "../index.js";
+import { withProviderOperation } from "../operation.js";
+import { SQLiteWorkspaceProvider } from "../provider.js";
 import { initializeSchema, ROOT_INODE } from "../schema/index.js";
 import { Database, type Database as DatabaseType, isDatabaseOperationView } from "../storage.js";
 import { coalesceChanges } from "../sync/coalesce.js";
@@ -20,7 +22,9 @@ import { stat } from "./stat.js";
 import { withDB } from "./with-db.js";
 import {
   DEFAULT_WRITE_BATCH_LIMITS,
+  flushWriteBatchBeforeRead,
   flushWriteBatchSync,
+  withProviderWriteBatch,
   withWriteBatchSync,
 } from "./writeBatch.js";
 import { chunksOf, writeFileSync } from "./writeFile.js";
@@ -773,6 +777,139 @@ describe("synchronous write batches", () => {
         }
       });
 
+      expect(counting.snapshot().statements).toBeLessThan(40);
+    });
+  });
+});
+
+describe("asynchronous provider write batches", () => {
+  it("bounds but retains directory metadata across more than one SQL page", async () => {
+    await withCountingDatabase(async (db) => {
+      prepareDirectory(db);
+      const provider = new SQLiteWorkspaceProvider(db, { now: NOW });
+      for (let directory = 0; directory < 40; directory += 1) {
+        const path = `/ready/d${String(directory).padStart(2, "0")}`;
+        provider.mkdirSync(path);
+        for (let file = 0; file < 30; file += 1) {
+          provider.writeFileSync(`${path}/f${String(file).padStart(2, "0")}`, "x");
+        }
+      }
+
+      await withProviderOperation(provider, (operationProvider) =>
+        withProviderWriteBatch(operationProvider, async (batchProvider) => {
+          for (let directory = 0; directory < 40; directory += 1) {
+            const path = `/ready/d${String(directory).padStart(2, "0")}/new`;
+            await batchProvider.writeFile(path, "new");
+          }
+          expect(db.scalar<number>("SELECT COUNT(*) FROM vfs_dirents WHERE name = 'new'")).toBe(0);
+        }),
+      );
+    });
+  });
+
+  it("preserves unrelated operation metadata across a controlled batch flush", async () => {
+    await withCountingDatabase(async (db, counting) => {
+      prepareDirectory(db);
+      mkdir(db, "/work", {}, NOW);
+      writeText(db, "/work/known", "known");
+
+      await withProviderOperation(
+        new SQLiteWorkspaceProvider(db, { now: NOW }),
+        (operationProvider) =>
+          withProviderWriteBatch(operationProvider, async (batchProvider) => {
+            expect(await batchProvider.readdir("/work")).toEqual(["known"]);
+            await batchProvider.writeFile("/ready/new", "new");
+            flushWriteBatchBeforeRead(batchProvider.db);
+            counting.reset();
+            expect(resolveInode(batchProvider.db, "/work/known")?.type).toBe("file");
+            expect(counting.snapshot().statements).toBe(0);
+          }),
+        { metadataPrefetchThreshold: 1 },
+      );
+    });
+  });
+
+  it("preserves unrelated operation metadata across an existing-file write", async () => {
+    await withCountingDatabase(async (db, counting) => {
+      prepareDirectory(db);
+      writeText(db, "/ready/index", "old index");
+      mkdir(db, "/work", {}, NOW);
+      writeText(db, "/work/known", "known");
+
+      await withProviderOperation(
+        new SQLiteWorkspaceProvider(db, { now: NOW }),
+        async (operationProvider) => {
+          expect(await operationProvider.readdir("/work")).toEqual(["known"]);
+          await operationProvider.writeFile("/ready/index", "new index");
+          counting.reset();
+          expect(resolveInode(operationProvider.db, "/work/known")?.type).toBe("file");
+          expect(counting.snapshot().statements).toBe(0);
+        },
+        { metadataPrefetchThreshold: 1 },
+      );
+    });
+  });
+
+  it("keeps new directories and their files staged across awaits", async () => {
+    await withCountingDatabase(async (db, counting) => {
+      const parentInode = prepareDirectory(db);
+      const provider = new SQLiteWorkspaceProvider(db, { now: NOW });
+      counting.reset();
+
+      await withProviderOperation(provider, (operationProvider) =>
+        withProviderWriteBatch(operationProvider, async (batchProvider) => {
+          for (let index = 0; index < 20; index += 1) {
+            const directory = `/ready/o${String(index).padStart(2, "0")}`;
+            await batchProvider.mkdir(directory, { recursive: true });
+            if (index === 0) expect(childCount(db, parentInode)).toBe(0);
+            await batchProvider.writeFile(`${directory}/object`, `content ${index}`);
+            const staged = await batchProvider.lstat(directory);
+            expect(staged.isDirectory()).toBe(true);
+            if (index === 0) {
+              counting.reset();
+              expect(() => batchProvider.lstatSync(`${directory}/missing`)).toThrowError(
+                expect.objectContaining({ code: "ENOENT" }),
+              );
+              expect(counting.snapshot().statements).toBe(0);
+            }
+          }
+          expect(childCount(db, parentInode)).toBe(0);
+        }),
+      );
+
+      expect(childNames(db, parentInode)).toHaveLength(20);
+      expect(counting.snapshot().statements).toBeLessThan(40);
+    });
+  });
+
+  it("keeps creates staged across awaits while lstat sees their metadata", async () => {
+    await withCountingDatabase(async (db, counting) => {
+      const parentInode = prepareDirectory(db);
+      const provider = new SQLiteWorkspaceProvider(db, { now: NOW });
+      counting.reset();
+
+      await withProviderOperation(provider, (operationProvider) =>
+        withProviderWriteBatch(operationProvider, async (batchProvider) => {
+          for (let index = 0; index < 10; index += 1) {
+            const content = `content ${index}`;
+            const path = `/ready/file-${index}.txt`;
+            expect(() => batchProvider.lstatSync(path)).toThrowError(
+              expect.objectContaining({ code: "ENOENT" }),
+            );
+            await batchProvider.writeFile(path, content);
+            await Promise.resolve();
+
+            const staged = await batchProvider.lstat(path);
+            expect(staged.isFile()).toBe(true);
+            expect(staged.size).toBe(encoder.encode(content).byteLength);
+          }
+          expect(childCount(db, parentInode)).toBe(0);
+        }),
+      );
+
+      expect(childNames(db, parentInode)).toEqual(
+        Array.from({ length: 10 }, (_, index) => `file-${index}.txt`),
+      );
       expect(counting.snapshot().statements).toBeLessThan(40);
     });
   });

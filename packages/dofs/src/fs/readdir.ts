@@ -9,6 +9,8 @@ import {
   lookupCompleteDirectory,
 } from "./metadataPrefetch.js";
 import { resolveInode } from "./resolve.js";
+import { prefetchMetadataSubtreeIfWalking } from "./subtreePrefetch.js";
+import { flushWriteBatchBeforeDirectoryRead } from "./writeBatch.js";
 import { getWriteBuffer, listPendingByParent } from "./writeBuffer.js";
 
 export interface WorkspaceDirentResult {
@@ -51,6 +53,7 @@ export function readdir(
   if (node.type !== "dir") {
     throw createWorkspaceError("ENOTDIR", `not a directory: ${canonical}`, canonical);
   }
+  flushWriteBatchBeforeDirectoryRead(db, node.inode);
 
   const limit = options.limit;
   if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
@@ -88,6 +91,11 @@ export function readdir(
   if (complete) {
     const cached = lookupCompleteDirectory(db, canonical, node.inode);
     if (cached !== undefined) return cached.map((entry) => toResult(db, canonical, entry));
+    prefetchMetadataSubtreeIfWalking(db, canonical);
+    const prefetched = lookupCompleteDirectory(db, canonical, node.inode);
+    if (prefetched !== undefined) {
+      return prefetched.map((entry) => toResult(db, canonical, entry));
+    }
   }
 
   // Pending creates live outside SQLite until their final release. If there

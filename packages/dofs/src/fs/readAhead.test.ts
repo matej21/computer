@@ -4,10 +4,17 @@ import { CountingStorage } from "../bench/counting-storage.js";
 import { withDatabaseOperation } from "../operation.js";
 import { SQLiteWorkspaceProvider } from "../provider.js";
 import { initializeSchema } from "../schema/index.js";
-import { Database } from "../storage.js";
+import {
+  claimDatabaseOperationReadAhead,
+  Database,
+  noteDatabaseOperationReadAheadRead,
+  storeDatabaseOperationReadAheadPage,
+  takeDatabaseOperationReadAheadFile,
+} from "../storage.js";
 import { SQLiteTestStorage } from "../testing.js";
 import { clearBlobCache } from "./blobCache.js";
 import { mkdir } from "./mkdir.js";
+import { readdir } from "./readdir.js";
 import { readFile } from "./readFile.js";
 import { clearResolveCache } from "./resolveCache.js";
 import { symlink } from "./symlink.js";
@@ -65,7 +72,9 @@ function recordQueries(db: Database): { records: QueryRecord[]; stop: () => void
 
 function readsBlobPayload(record: QueryRecord): boolean {
   const query = record.query.toLowerCase();
-  return query.startsWith("select") && query.includes("vfs_blob_bytes");
+  return (
+    (query.startsWith("select") || query.startsWith("with")) && query.includes("vfs_blob_bytes")
+  );
 }
 
 function payloadReads(records: readonly QueryRecord[], from = 0): QueryRecord[] {
@@ -190,6 +199,35 @@ describe("operation-local small-file read-ahead", () => {
           recording.stop();
         }
       });
+    });
+  });
+
+  it("uses an operation metadata listing without rescanning the directory", async () => {
+    await withCountingDatabase(async (db, provider) => {
+      const paths = writeSmallDirectory(provider, "/objects/known", 40);
+      resetReadCaches(db);
+
+      await withDatabaseOperation(
+        db,
+        async (operationDb: Database) => {
+          expect(await readdir(operationDb, "/objects/known")).toHaveLength(40);
+          const recording = recordQueries(operationDb);
+          try {
+            for (let index = 0; index < paths.length; index += 1) {
+              await expect(readText(operationDb, paths[index])).resolves.toBe(`object ${index}`);
+            }
+            expect(payloadReads(recording.records)).toHaveLength(5);
+            expect(
+              recording.records.some((record) =>
+                record.query.includes("candidate_input AS MATERIALIZED"),
+              ),
+            ).toBe(false);
+          } finally {
+            recording.stop();
+          }
+        },
+        { metadataPrefetchThreshold: 1 },
+      );
     });
   });
 
@@ -347,7 +385,7 @@ describe("operation-local small-file read-ahead", () => {
     });
   });
 
-  it("stops probing when the complete-read exclusion history is full", async () => {
+  it("keeps probing after four thousand completed reads", async () => {
     await withCountingDatabase(async (db, provider) => {
       const readHistoryEntries = 4000;
       seedEmptyFiles(db, "/history", readHistoryEntries);
@@ -366,16 +404,60 @@ describe("operation-local small-file read-ahead", () => {
         const recording = recordQueries(operationDb);
         try {
           await expect(readText(operationDb, targetPaths[0])).resolves.toBe("object 0");
-          expect.soft(payloadReads(recording.records)).toHaveLength(0);
+          expect.soft(payloadReads(recording.records)).toHaveLength(1);
           expect(
             recording.records.some((record) =>
               record.query.includes("candidate_input AS MATERIALIZED"),
             ),
-          ).toBe(false);
+          ).toBe(true);
         } finally {
           recording.stop();
         }
       });
+    });
+  });
+
+  it("reuses the held-entry budget after speculative files are handed off", async () => {
+    await withCountingDatabase(async (db) => {
+      await withDatabaseOperation(db, async (operationDb: Database) => {
+        for (let inode = 1; inode <= 4; inode += 1) {
+          noteDatabaseOperationReadAheadRead(operationDb, "/first", inode);
+        }
+        expect(claimDatabaseOperationReadAhead(operationDb, "/first")).toBeDefined();
+
+        const emptyFile = { bytes: new Uint8Array(), blobs: [] };
+        const files = new Map(
+          Array.from({ length: 4000 }, (_, index) => [index + 1, emptyFile] as const),
+        );
+        expect(storeDatabaseOperationReadAheadPage(operationDb, files, 0, files.size)).toBe(true);
+        for (const inode of files.keys()) takeDatabaseOperationReadAheadFile(operationDb, inode);
+
+        for (let inode = 5001; inode <= 5004; inode += 1) {
+          noteDatabaseOperationReadAheadRead(operationDb, "/second", inode);
+        }
+        expect(claimDatabaseOperationReadAhead(operationDb, "/second")).toMatchObject({
+          remainingBytes: 8 * 1024 * 1024,
+          remainingEntries: 4000,
+        });
+      });
+    });
+  });
+
+  it("uses operation-specific held payload limits", async () => {
+    await withCountingDatabase(async (db) => {
+      await withDatabaseOperation(
+        db,
+        async (operationDb: Database) => {
+          for (let inode = 1; inode <= 4; inode += 1) {
+            noteDatabaseOperationReadAheadRead(operationDb, "/limited", inode);
+          }
+          expect(claimDatabaseOperationReadAhead(operationDb, "/limited")).toMatchObject({
+            remainingBytes: 1234,
+            remainingEntries: 17,
+          });
+        },
+        { maxReadAheadBytes: 1234, maxReadAheadEntries: 17 },
+      );
     });
   });
 

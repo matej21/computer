@@ -30,7 +30,12 @@ export type StatusMatrixRow = [
 
 /** Subset of `isomorphic-git`'s API used for `status`. */
 export interface IsomorphicGitStatusClient {
-  statusMatrix(args: { fs: object; dir: string; cache?: object }): Promise<StatusMatrixRow[]>;
+  statusMatrix(args: {
+    fs: object;
+    dir: string;
+    cache?: object;
+    refresh?: boolean;
+  }): Promise<StatusMatrixRow[]>;
 }
 
 export interface GitStatusOptions {
@@ -66,7 +71,7 @@ export async function statusWith(opts: StatusWithDeps): Promise<StatusEntry[]> {
   const dir = opts.dir ?? "/";
   let rows: StatusMatrixRow[];
   try {
-    rows = await opts.git.statusMatrix({ fs: opts.fs, dir, cache: opts.cache });
+    rows = await opts.git.statusMatrix({ fs: opts.fs, dir, cache: opts.cache, refresh: false });
   } catch (cause) {
     if (isNotARepositoryCause(cause)) throw new NotARepositoryError(dir, { cause });
     throw new GitError("ESTATUSFAIL", `git status failed: ${errorMessage(cause)}`, { cause });

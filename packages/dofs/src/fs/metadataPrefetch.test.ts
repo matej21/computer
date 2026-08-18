@@ -97,11 +97,151 @@ function seedWideDirectory(db: Database, directory: string, width: number): void
   });
 }
 
+function seedWideLevel(db: Database, directories: number, filesPerDirectory: number): void {
+  mkdir(db, "/tree", {}, NOW);
+  const tree = resolveInode(db, "/tree");
+  if (tree?.type !== "dir") throw new Error("wide-level fixture root is missing");
+  const firstDirectory =
+    (db.scalar<number>("SELECT COALESCE(MAX(inode), 0) FROM vfs_nodes") ?? 0) + 1;
+  db.transactionSync(() => {
+    db.run(
+      `WITH RECURSIVE sequence(value) AS (
+         SELECT 0
+         UNION ALL
+         SELECT value + 1 FROM sequence WHERE value + 1 < ?
+       )
+       INSERT INTO vfs_nodes (type, mode, mtime, rev, size)
+       SELECT 'dir', ?, ?, 0, 0 FROM sequence`,
+      directories,
+      0o755,
+      NOW(),
+    );
+    db.run(
+      `INSERT INTO vfs_dirents (parent_inode, name, child_inode)
+       SELECT ?, printf('d%03d', inode - ?), inode
+         FROM vfs_nodes
+        WHERE inode >= ? AND inode < ?
+        ORDER BY inode`,
+      tree.inode,
+      firstDirectory,
+      firstDirectory,
+      firstDirectory + directories,
+    );
+    const firstFile = firstDirectory + directories;
+    db.run(
+      `WITH RECURSIVE
+         directories(value) AS (
+           SELECT 0
+           UNION ALL
+           SELECT value + 1 FROM directories WHERE value + 1 < ?
+         ),
+         files(value) AS (
+           SELECT 0
+           UNION ALL
+           SELECT value + 1 FROM files WHERE value + 1 < ?
+         )
+       INSERT INTO vfs_nodes (type, mode, mtime, rev, size)
+       SELECT 'file', ?, ?, 0, 0 FROM directories CROSS JOIN files`,
+      directories,
+      filesPerDirectory,
+      0o644,
+      NOW(),
+    );
+    db.run(
+      `INSERT INTO vfs_dirents (parent_inode, name, child_inode)
+       SELECT ? + CAST((inode - ?) / ? AS INTEGER),
+              printf('f%03d', (inode - ?) % ?),
+              inode
+         FROM vfs_nodes
+        WHERE inode >= ?
+        ORDER BY inode`,
+      firstDirectory,
+      firstFile,
+      filesPerDirectory,
+      firstFile,
+      filesPerDirectory,
+      firstFile,
+    );
+  });
+}
+
 function statementDelta(counting: CountingStorage, before: number): number {
   return counting.snapshot().statements - before;
 }
 
 describe("operation-local metadata prefetch", () => {
+  it("prefetches from the first listing when the operation requests eager traversal", async () => {
+    await withCountingDatabase((db, provider, counting) => {
+      for (const name of ["a", "b", "c"]) writeFiles(provider, `/tree/${name}`, ["file"]);
+      clearResolveCache(db);
+      const eagerOptions: MetadataPrefetchOptions & { metadataPrefetchThreshold: number } = {
+        ...prefetchOptions(),
+        metadataPrefetchThreshold: 1,
+      };
+
+      withDatabaseOperation(
+        db,
+        (operationDb: Database) => {
+          readdir(operationDb, "/tree");
+          counting.reset();
+          expect(readdir(operationDb, "/tree/c")).toHaveLength(1);
+          expect(resolveInode(operationDb, "/tree/missing/object")).toBeNull();
+          expect(counting.snapshot().statements).toBe(0);
+        },
+        eagerOptions,
+      );
+    });
+  });
+
+  it("prefetches a shared subtree after four structural directory listings", async () => {
+    await withCountingDatabase((db, provider, counting) => {
+      for (const name of ["a", "b", "c", "d", "e", "f", "g"]) {
+        writeFiles(provider, `/tree/${name}`, ["file"]);
+      }
+      clearResolveCache(db);
+
+      withDatabaseOperation(
+        db,
+        (operationDb: Database) => {
+          for (const name of ["a", "b", "c"]) readdir(operationDb, `/tree/${name}`);
+          const before = counting.snapshot().statements;
+
+          readdir(operationDb, "/tree/d");
+          readdir(operationDb, "/tree/e");
+          readdir(operationDb, "/tree/f");
+          readdir(operationDb, "/tree/g");
+          expect(resolveInode(operationDb, "/tree/g/missing")).toBeNull();
+          expect(statementDelta(counting, before)).toBe(4);
+        },
+        prefetchOptions(),
+      );
+    });
+  });
+
+  it("pages a wide breadth-first level without dropping later directories", async () => {
+    await withCountingDatabase((db, _provider, counting) => {
+      seedWideLevel(db, 150, 150);
+      clearResolveCache(db);
+
+      withDatabaseOperation(
+        db,
+        (operationDb: Database) => {
+          readdir(operationDb, "/tree");
+          for (const name of ["d000", "d001", "d002"]) {
+            readdir(operationDb, `/tree/${name}`);
+          }
+          counting.reset();
+          expect(readdir(operationDb, "/tree/d149")).toHaveLength(150);
+          expect(counting.snapshot().statements).toBe(0);
+        },
+        prefetchOptions({
+          maxReadCacheEntries: 8,
+          maxMetadataPrefetchBytes: 24 * 1024 * 1024,
+        }),
+      );
+    });
+  });
+
   it("serves repeated complete listings and known child hits or misses without SQL", async () => {
     await withCountingDatabase((db, provider, counting) => {
       writeFiles(provider, "/dir", ["a", "b", "c"]);

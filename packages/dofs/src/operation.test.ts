@@ -53,6 +53,31 @@ function statementDelta(counting: CountingStorage, before: number): number {
 }
 
 describe("database operation views", () => {
+  it("defers provider hardlink counts and reuses resolved file sizes", async () => {
+    await withCountingDatabase((db, counting) => {
+      writeFileSync(db, "/file.txt", new TextEncoder().encode("content"), {}, NOW);
+      const provider = new SQLiteWorkspaceProvider(db, { now: NOW });
+
+      withProviderOperation(provider, (operationProvider) => {
+        counting.reset();
+        const stat = operationProvider.statSync("/file.txt");
+        const statementsBeforeNlink = counting.snapshot().statements;
+        expect(stat.size).toBe(7);
+        expect(counting.queries.some((query) => query.includes("SELECT size FROM vfs_nodes"))).toBe(
+          false,
+        );
+        expect(stat.nlink).toBe(1);
+        expect(counting.snapshot().statements).toBe(statementsBeforeNlink + 1);
+
+        counting.reset();
+        expect(operationProvider.lstatSync("/file.txt").size).toBe(7);
+        expect(counting.queries.some((query) => query.includes("SELECT size FROM vfs_nodes"))).toBe(
+          false,
+        );
+      });
+    });
+  });
+
   it("keeps the operation API internal and preserves callback return types", async () => {
     expect(databaseOperationIsInternal).toBe(false);
     expect(providerOperationIsInternal).toBe(false);

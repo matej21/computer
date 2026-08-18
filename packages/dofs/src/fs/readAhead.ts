@@ -2,8 +2,10 @@ import { canonicalizePath } from "../path.js";
 import {
   claimDatabaseOperationReadAhead,
   type Database,
+  type DatabaseOperationDirectoryEntry,
   type DatabaseOperationReadAheadBlob,
   type DatabaseOperationReadAheadFile,
+  lookupDatabaseOperationDirectory,
   noteDatabaseOperationReadAheadRead,
   storeDatabaseOperationReadAheadPage,
   takeDatabaseOperationReadAheadFile,
@@ -83,18 +85,29 @@ export function takeOrReadAheadCompleteFile(
   }
 
   const excluded = new Set([...claim.excludedInodes, ...listDirtyWriteBufferInodes(db)]);
+  const knownDirectory = lookupDatabaseOperationDirectory(db, context.parentPath, parent.inode);
   let remainingBytes = claim.remainingBytes;
   let remainingEntries = claim.remainingEntries;
   let afterName = "";
   while (remainingEntries > 0) {
-    const page = readPage(
-      db,
-      parent.inode,
-      afterName,
-      excluded,
-      Math.min(MAX_PAGE_BYTES, remainingBytes),
-      Math.min(MAX_PAGE_ENTRIES, remainingEntries),
-    );
+    const page =
+      knownDirectory === undefined
+        ? readPage(
+            db,
+            parent.inode,
+            afterName,
+            excluded,
+            Math.min(MAX_PAGE_BYTES, remainingBytes),
+            Math.min(MAX_PAGE_ENTRIES, remainingEntries),
+          )
+        : readKnownPage(
+            db,
+            knownDirectory.entries,
+            afterName,
+            excluded,
+            Math.min(MAX_PAGE_BYTES, remainingBytes),
+            Math.min(MAX_PAGE_ENTRIES, remainingEntries),
+          );
     if (page === undefined) break;
     if (
       !storeDatabaseOperationReadAheadPage(db, page.files, page.fetchedBytes, page.fetchedEntries)
@@ -227,6 +240,70 @@ function readPage(
     maxEntries,
     maxBytes,
   );
+  return assemblePage(rows);
+}
+
+function readKnownPage(
+  db: Database,
+  entries: readonly DatabaseOperationDirectoryEntry[],
+  afterName: string,
+  excluded: ReadonlySet<number>,
+  maxBytes: number,
+  maxEntries: number,
+): ReadAheadPage | undefined {
+  const selected: DatabaseOperationDirectoryEntry[] = [];
+  let selectedBytes = 0;
+  let hasMore = false;
+  for (const entry of entries) {
+    if (
+      entry.name <= afterName ||
+      entry.type !== "file" ||
+      entry.size > MAX_FILE_BYTES ||
+      excluded.has(entry.inode)
+    ) {
+      continue;
+    }
+    if (selected.length >= maxEntries || selectedBytes + entry.size > maxBytes) {
+      hasMore = true;
+      break;
+    }
+    selected.push(entry);
+    selectedBytes += entry.size;
+  }
+  if (selected.length === 0) return undefined;
+
+  const rows = db.all<PageRow>(
+    `WITH wanted AS (
+       SELECT json_extract(value, '$.name') AS name,
+              json_extract(value, '$.inode') AS inode,
+              json_extract(value, '$.size') AS size,
+              json_extract(value, '$.mode') AS mode,
+              json_extract(value, '$.mtime') AS mtime
+         FROM json_each(?)
+     )
+     SELECT wanted.name AS name,
+            wanted.inode AS inode,
+            wanted.size AS size,
+            wanted.mode AS mode,
+            wanted.mtime AS mtime,
+            ? AS candidate_count,
+            ? AS input_has_more,
+            c.idx AS idx,
+            c.hash AS hash,
+            c.size AS chunk_size,
+            b.bytes AS bytes
+       FROM wanted
+       LEFT JOIN vfs_chunks c ON c.inode = wanted.inode
+       LEFT JOIN vfs_blob_bytes b ON b.hash = c.hash
+      ORDER BY wanted.name, c.idx`,
+    JSON.stringify(selected),
+    selected.length,
+    hasMore ? 1 : 0,
+  );
+  return assemblePage(rows);
+}
+
+function assemblePage(rows: readonly PageRow[]): ReadAheadPage | undefined {
   if (rows.length === 0) return undefined;
 
   const files = new Map<number, DatabaseOperationReadAheadFile>();

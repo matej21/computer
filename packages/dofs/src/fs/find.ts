@@ -9,6 +9,7 @@ import {
   discardDirectoryMetadataCollector,
 } from "./metadataPrefetch.js";
 import { resolveInode } from "./resolve.js";
+import { flushWriteBatchBeforeRead } from "./writeBatch.js";
 
 export interface WorkspaceFoundEntry {
   path: string;
@@ -47,6 +48,7 @@ export function find(
   pattern?: string,
   options: FindOptions = {},
 ): WorkspaceFoundEntry[] {
+  flushWriteBatchBeforeRead(db);
   const start = prepareWalk(db, directory, pattern);
   const limit = options.limit ?? Number.MAX_SAFE_INTEGER;
   if (!Number.isSafeInteger(limit) || limit < 0) {
@@ -75,6 +77,7 @@ export function* iterateFoundEntries(
   directory: string,
   pattern?: string,
 ): IterableIterator<WorkspaceFoundEntry> {
+  flushWriteBatchBeforeRead(db);
   const start = prepareWalk(db, directory, pattern);
   yield* walk(db, start.inode, start.path, start.prefix, start.regex);
 }

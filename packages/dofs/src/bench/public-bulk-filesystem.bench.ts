@@ -138,6 +138,63 @@ function buildEmptyFiles(
   });
 }
 
+function buildSharedChunkFiles(
+  db: Database,
+  provider: SQLiteWorkspaceProvider,
+  directory: string,
+  count: number,
+): void {
+  provider.mkdirSync(directory, { recursive: true });
+  if (count === 0) return;
+  provider.writeFileSync(`${directory}/seed`, "x");
+  const parentInode = db.scalar<number>(
+    "SELECT child_inode FROM vfs_dirents WHERE parent_inode = 1 AND name = ?",
+    directory.slice(1),
+  );
+  const hash = db.scalar<Uint8Array>(
+    `SELECT c.hash
+       FROM vfs_chunks c
+       JOIN vfs_dirents d ON d.child_inode = c.inode
+      WHERE d.parent_inode = ? AND d.name = 'seed'`,
+    parentInode,
+  );
+  if (parentInode === undefined || hash === undefined) {
+    throw new Error("benchmark chunk fixture is missing");
+  }
+  const firstInode = (db.scalar<number>("SELECT COALESCE(MAX(inode), 0) FROM vfs_nodes") ?? 0) + 1;
+  db.transactionSync(() => {
+    db.run(
+      `WITH RECURSIVE sequence(value) AS (
+         SELECT 0
+         UNION ALL
+         SELECT value + 1 FROM sequence WHERE value + 1 < ?
+       )
+       INSERT INTO vfs_nodes (type, mode, mtime, rev, size)
+       SELECT 'file', ?, 1000, 0, 1 FROM sequence`,
+      count,
+      0o644,
+    );
+    db.run(
+      `INSERT INTO vfs_dirents (parent_inode, name, child_inode)
+       SELECT ?, 'u' || printf('%05d', inode - ?), inode
+         FROM vfs_nodes
+        WHERE inode >= ?
+        ORDER BY inode`,
+      parentInode,
+      firstInode,
+      firstInode,
+    );
+    db.run(
+      `INSERT INTO vfs_chunks (inode, idx, hash, size)
+       SELECT inode, 0, ?, 1
+         FROM vfs_nodes
+        WHERE inode >= ?`,
+      hash,
+      firstInode,
+    );
+  });
+}
+
 function reportRead(result: ReadBenchmarkResult, pages: number, baseline: StatementCounts): void {
   benchmarkReport({
     scenario: result.name,
@@ -274,6 +331,30 @@ it("removes 500 files in fewer than fifteen statements", async () => {
   reportMutation(result, baseline);
   expect(result.statements).toBeLessThan(15);
   expect(result.statements).toBeLessThan(baseline.statements);
+});
+
+it("keeps rmFiles row work independent of unrelated directory width", async () => {
+  const paths = Array.from(
+    { length: 50 },
+    (_, index) => `/remove/f${String(index).padStart(4, "0")}`,
+  );
+  const countRemoval = (unrelatedFiles: number) =>
+    countOperation(
+      (db, provider) => {
+        buildFiles(provider, "/remove", paths.length);
+        buildSharedChunkFiles(db, provider, "/unrelated", unrelatedFiles);
+      },
+      (fs) =>
+        fs.rmFiles(paths, {
+          maxEntries: 10_000,
+          maxMetadataBytes: 4 * MIB,
+        }),
+    );
+
+  const narrow = await countRemoval(0);
+  const wide = await countRemoval(WIDE_FILES);
+  expect(wide.statements).toBe(narrow.statements);
+  expect(wide.rowsRead).toBeLessThanOrEqual(narrow.rowsRead * 2);
 });
 
 it("copies a 500-file tree by metadata in fewer than fifteen statements", async () => {

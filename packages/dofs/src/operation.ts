@@ -12,11 +12,17 @@ export interface DatabaseOperationOptions {
   maxReadCacheEntries?: number;
   maxMetadataPrefetchBytes?: number;
   maxMetadataPrefetchDirectoryEntries?: number;
+  metadataPrefetchThreshold?: number;
+  maxReadAheadBytes?: number;
+  maxReadAheadEntries?: number;
 }
 
 const DEFAULT_MAX_READ_CACHE_ENTRIES = 8192;
-const DEFAULT_MAX_METADATA_PREFETCH_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_METADATA_PREFETCH_BYTES = 24 * 1024 * 1024;
 const DEFAULT_MAX_METADATA_PREFETCH_DIRECTORY_ENTRIES = 20_000;
+const DEFAULT_METADATA_PREFETCH_THRESHOLD = 4;
+const DEFAULT_MAX_READ_AHEAD_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_READ_AHEAD_ENTRIES = 4000;
 
 export function withDatabaseOperation<T>(
   db: Database,
@@ -55,11 +61,23 @@ function runDatabaseOperation<T>(
     options.maxMetadataPrefetchDirectoryEntries,
     DEFAULT_MAX_METADATA_PREFETCH_DIRECTORY_ENTRIES,
   );
+  const metadataPrefetchThreshold = Math.max(
+    1,
+    boundedOption(options.metadataPrefetchThreshold, DEFAULT_METADATA_PREFETCH_THRESHOLD),
+  );
+  const maxReadAheadBytes = boundedOption(options.maxReadAheadBytes, DEFAULT_MAX_READ_AHEAD_BYTES);
+  const maxReadAheadEntries = boundedOption(
+    options.maxReadAheadEntries,
+    DEFAULT_MAX_READ_AHEAD_ENTRIES,
+  );
   const operationDb = createDatabaseOperationView(
     db,
     maxReadCacheEntries,
     maxMetadataPrefetchBytes,
     maxMetadataPrefetchDirectoryEntries,
+    metadataPrefetchThreshold,
+    maxReadAheadBytes,
+    maxReadAheadEntries,
   );
   try {
     const result = run(operationDb);

@@ -1,4 +1,5 @@
 import {
+  claimDatabaseOperationDirectoryListing,
   createDatabaseOperationDirectoryReservation,
   type Database,
   type DatabaseOperationDirectory,
@@ -103,17 +104,97 @@ export function lookupCompleteDirectoryChild(
   return entry === undefined ? { kind: "absent" } : { kind: "entry", entry };
 }
 
+export function lookupAdaptiveDirectoryChild(
+  db: Database,
+  parentPath: string,
+  parentInode: number,
+  childName: string,
+): DirectoryChildLookup | undefined {
+  const cached = lookupCompleteDirectoryChild(db, parentPath, childName);
+  if (cached !== undefined || !claimDatabaseOperationDirectoryListing(db, parentInode)) {
+    return cached;
+  }
+  loadCompleteDirectoryMetadata(db, parentPath, parentInode);
+  return lookupCompleteDirectoryChild(db, parentPath, childName);
+}
+
+interface CompleteDirectoryRow {
+  inode: number;
+  name: string;
+  type: "file" | "dir" | "symlink";
+  mode: number;
+  mtime: number;
+  size: number;
+  link_target: string | null;
+}
+
+function loadCompleteDirectoryMetadata(
+  db: Database,
+  parentPath: string,
+  parentInode: number,
+): void {
+  const collector = createDirectoryMetadataCollector(db, parentPath, parentInode);
+  const maxEntries = databaseOperationDirectoryMaxEntries(db);
+  if (collector === undefined || maxEntries === undefined) return;
+  const rows = db.all<CompleteDirectoryRow>(
+    `SELECT n.inode AS inode,
+            d.name AS name,
+            n.type AS type,
+            n.mode AS mode,
+            n.mtime AS mtime,
+            n.size AS size,
+            n.link_target AS link_target
+       FROM vfs_dirents d
+       JOIN vfs_nodes n ON n.inode = d.child_inode
+      WHERE d.parent_inode = ?
+      ORDER BY d.name
+      LIMIT ?`,
+    parentInode,
+    maxEntries + 1,
+  );
+  if (rows.length > maxEntries) {
+    collector.discard(db);
+    return;
+  }
+  for (const row of rows) {
+    collector.collect(db, parentPath, {
+      inode: row.inode,
+      name: row.name,
+      type: row.type,
+      mode: row.mode,
+      mtime: row.mtime,
+      size: row.size,
+      linkTarget: row.link_target ?? undefined,
+    });
+  }
+  admitCollectedDirectory(db, parentPath, parentInode, collector);
+}
+
 export function createDirectoryMetadataCollector(
   db: Database,
   parentPath: string,
   parentInode: number,
 ): DirectoryMetadataCollector | undefined {
-  if (
-    !isOperationStructuralPath(db, parentPath, parentInode) ||
-    listPendingByParent(db, parentInode).length > 0
-  ) {
+  if (!isOperationStructuralPath(db, parentPath, parentInode)) {
     return undefined;
   }
+  return createStructuralDirectoryMetadataCollector(db, parentPath, parentInode);
+}
+
+export function createPrefetchedDirectoryMetadataCollector(
+  db: Database,
+  parentPath: string,
+  parentInode: number,
+): DirectoryMetadataCollector | undefined {
+  return createStructuralDirectoryMetadataCollector(db, parentPath, parentInode);
+}
+
+function createStructuralDirectoryMetadataCollector(
+  db: Database,
+  parentPath: string,
+  parentInode: number,
+): DirectoryMetadataCollector | undefined {
+  if (listPendingByParent(db, parentInode).length > 0) return undefined;
   const maxEntries = databaseOperationDirectoryMaxEntries(db);
   const retainedBytes = directoryBaseBytes(parentPath);
   if (maxEntries === undefined) return undefined;

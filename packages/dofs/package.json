@@ -11,6 +11,14 @@
     "./testing": {
       "types": "./dist/testing.d.ts",
       "default": "./dist/testing.js"
+    },
+    "./internal/operation": {
+      "types": "./dist/operation.d.ts",
+      "default": "./dist/operation.js"
+    },
+    "./internal/write-batch": {
+      "types": "./dist/fs/writeBatch.d.ts",
+      "default": "./dist/fs/writeBatch.js"
     }
   },
   "types": "./dist/index.d.ts",

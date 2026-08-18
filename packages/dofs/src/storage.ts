@@ -13,10 +13,17 @@ interface OperationState {
   metadataPrefetchBytes: number;
   metadataReservationBytes: number;
   nextMetadataReservationId: number;
+  metadataListedDirectories: number;
+  readonly metadataPrefetchThreshold: number;
+  metadataPrefetchRoot: string | undefined;
+  metadataSubtreePrefetched: boolean;
+  readonly metadataDirectoryProbes: Map<number, number>;
   readonly readAheadFiles: Map<number, DatabaseOperationReadAheadFile>;
   readonly readAheadProbes: Map<string, Set<number>>;
   readonly readAheadAttemptedDirectories: Set<string>;
   readonly readAheadReadInodes: Set<number>;
+  readonly maxReadAheadBytes: number;
+  readonly maxReadAheadEntries: number;
   readAheadProbeEntries: number;
   readAheadFetchedBytes: number;
   readAheadFetchedEntries: number;
@@ -42,8 +49,7 @@ export interface DatabaseOperationReadAheadClaim {
 }
 
 const READ_AHEAD_TRIGGER_READS = 4;
-const READ_AHEAD_MAX_OPERATION_BYTES = 8 * 1024 * 1024;
-const READ_AHEAD_MAX_OPERATION_ENTRIES = 4000;
+const READ_AHEAD_MAX_HISTORY_ENTRIES = 65_536;
 
 export interface DatabaseOperationDirectoryEntry {
   inode: number;
@@ -95,6 +101,9 @@ class DatabaseCore {
     maxReadCacheEntries: number,
     maxMetadataPrefetchBytes: number,
     maxMetadataPrefetchDirectoryEntries: number,
+    metadataPrefetchThreshold: number,
+    maxReadAheadBytes: number,
+    maxReadAheadEntries: number,
   ): OperationState {
     return {
       id: this.nextOperationId++,
@@ -107,10 +116,17 @@ class DatabaseCore {
       metadataPrefetchBytes: 0,
       metadataReservationBytes: 0,
       nextMetadataReservationId: 1,
+      metadataListedDirectories: 0,
+      metadataPrefetchThreshold,
+      metadataPrefetchRoot: undefined,
+      metadataSubtreePrefetched: false,
+      metadataDirectoryProbes: new Map(),
       readAheadFiles: new Map(),
       readAheadProbes: new Map(),
       readAheadAttemptedDirectories: new Set(),
       readAheadReadInodes: new Set(),
+      maxReadAheadBytes,
+      maxReadAheadEntries,
       readAheadProbeEntries: 0,
       readAheadFetchedBytes: 0,
       readAheadFetchedEntries: 0,
@@ -290,6 +306,9 @@ export function createDatabaseOperationView(
   maxReadCacheEntries: number,
   maxMetadataPrefetchBytes: number,
   maxMetadataPrefetchDirectoryEntries: number,
+  metadataPrefetchThreshold: number,
+  maxReadAheadBytes: number,
+  maxReadAheadEntries: number,
 ): Database {
   assertOpen(db);
   const core = coreForDatabase(db);
@@ -300,6 +319,9 @@ export function createDatabaseOperationView(
       maxReadCacheEntries,
       maxMetadataPrefetchBytes,
       maxMetadataPrefetchDirectoryEntries,
+      metadataPrefetchThreshold,
+      maxReadAheadBytes,
+      maxReadAheadEntries,
     ),
   );
   return view;
@@ -382,6 +404,38 @@ export function clearDatabaseOperationReadCache(db: Database): void {
   operation.generation = coreForDatabase(db).coherenceGeneration;
 }
 
+export function acceptDatabaseOperationFileWrites(db: Database, paths: readonly string[]): boolean {
+  assertOpen(db);
+  const operation = operations.get(db);
+  if (operation === undefined) return false;
+  operation.generation = coreForDatabase(db).coherenceGeneration;
+  operation.readCache.clear();
+  operation.metadataDirectoryProbes.clear();
+  operation.metadataReservations.clear();
+  operation.metadataReservationBytes = 0;
+  operation.readAheadFiles.clear();
+  operation.readAheadProbes.clear();
+  operation.readAheadAttemptedDirectories.clear();
+  operation.readAheadReadInodes.clear();
+  operation.readAheadProbeEntries = 0;
+  operation.readAheadFetchedBytes = 0;
+  operation.readAheadFetchedEntries = 0;
+
+  const changedDirectories = new Set<string>();
+  for (const path of paths) {
+    changedDirectories.add(path);
+    const separator = path.lastIndexOf("/");
+    changedDirectories.add(separator <= 0 ? "/" : path.slice(0, separator));
+  }
+  for (const path of changedDirectories) {
+    const directory = operation.metadataDirectories.get(path);
+    if (directory === undefined) continue;
+    operation.metadataDirectories.delete(path);
+    operation.metadataPrefetchBytes -= directory.retainedBytes;
+  }
+  return true;
+}
+
 export function lookupDatabaseOperationDirectory(
   db: Database,
   parentPath: string,
@@ -457,6 +511,30 @@ export function databaseOperationDirectoryMaxEntries(db: Database): number | und
   return readableOperation(db)?.maxMetadataPrefetchDirectoryEntries;
 }
 
+export function claimDatabaseOperationMetadataSubtreePrefetch(
+  db: Database,
+  canonicalPath: string,
+): string | undefined {
+  const operation = readableOperation(db);
+  if (operation === undefined || operation.metadataSubtreePrefetched) return undefined;
+  operation.metadataListedDirectories += 1;
+  operation.metadataPrefetchRoot =
+    operation.metadataPrefetchRoot === undefined
+      ? canonicalPath
+      : commonPathAncestor(operation.metadataPrefetchRoot, canonicalPath);
+  if (operation.metadataListedDirectories < operation.metadataPrefetchThreshold) return undefined;
+  operation.metadataSubtreePrefetched = true;
+  return operation.metadataPrefetchRoot;
+}
+
+export function claimDatabaseOperationDirectoryListing(db: Database, parentInode: number): boolean {
+  const operation = readableOperation(db);
+  if (operation === undefined) return false;
+  const probes = (operation.metadataDirectoryProbes.get(parentInode) ?? 0) + 1;
+  operation.metadataDirectoryProbes.set(parentInode, probes);
+  return probes === 4;
+}
+
 export function noteDatabaseOperationReadAheadRead(
   db: Database,
   parentPath: string,
@@ -464,9 +542,9 @@ export function noteDatabaseOperationReadAheadRead(
 ): void {
   const operation = readableOperation(db);
   if (operation === undefined) return;
-  if (operation.readAheadReadInodes.size >= READ_AHEAD_MAX_OPERATION_ENTRIES) return;
+  if (operation.readAheadReadInodes.size >= READ_AHEAD_MAX_HISTORY_ENTRIES) return;
   operation.readAheadReadInodes.add(inode);
-  if (operation.readAheadReadInodes.size >= READ_AHEAD_MAX_OPERATION_ENTRIES) {
+  if (operation.readAheadReadInodes.size >= READ_AHEAD_MAX_HISTORY_ENTRIES) {
     operation.readAheadProbes.clear();
     operation.readAheadProbeEntries = 0;
     return;
@@ -475,7 +553,7 @@ export function noteDatabaseOperationReadAheadRead(
 
   let probes = operation.readAheadProbes.get(parentPath);
   if (probes?.has(inode) === true) return;
-  if (operation.readAheadProbeEntries >= READ_AHEAD_MAX_OPERATION_ENTRIES) return;
+  if (operation.readAheadProbeEntries >= READ_AHEAD_MAX_HISTORY_ENTRIES) return;
   if (probes === undefined) {
     probes = new Set();
     operation.readAheadProbes.set(parentPath, probes);
@@ -494,10 +572,10 @@ export function claimDatabaseOperationReadAhead(
     operation === undefined ||
     probes === undefined ||
     probes.size < READ_AHEAD_TRIGGER_READS ||
-    operation.readAheadReadInodes.size >= READ_AHEAD_MAX_OPERATION_ENTRIES ||
+    operation.readAheadReadInodes.size >= READ_AHEAD_MAX_HISTORY_ENTRIES ||
     operation.readAheadAttemptedDirectories.has(parentPath) ||
-    operation.readAheadAttemptedDirectories.size >= READ_AHEAD_MAX_OPERATION_ENTRIES ||
-    operation.readAheadFetchedEntries >= READ_AHEAD_MAX_OPERATION_ENTRIES
+    operation.readAheadAttemptedDirectories.size >= READ_AHEAD_MAX_HISTORY_ENTRIES ||
+    operation.readAheadFetchedEntries >= operation.maxReadAheadEntries
   ) {
     return undefined;
   }
@@ -506,8 +584,8 @@ export function claimDatabaseOperationReadAhead(
   operation.readAheadProbeEntries -= probes.size;
   return {
     excludedInodes: [...operation.readAheadReadInodes, ...operation.readAheadFiles.keys()],
-    remainingBytes: READ_AHEAD_MAX_OPERATION_BYTES - operation.readAheadFetchedBytes,
-    remainingEntries: READ_AHEAD_MAX_OPERATION_ENTRIES - operation.readAheadFetchedEntries,
+    remainingBytes: operation.maxReadAheadBytes - operation.readAheadFetchedBytes,
+    remainingEntries: operation.maxReadAheadEntries - operation.readAheadFetchedEntries,
   };
 }
 
@@ -518,19 +596,23 @@ export function storeDatabaseOperationReadAheadPage(
   fetchedEntries: number,
 ): boolean {
   const operation = readableOperation(db);
+  if (operation === undefined) return false;
+  const admitted = [...files].filter(
+    ([inode]) => !operation.readAheadReadInodes.has(inode) && !operation.readAheadFiles.has(inode),
+  );
+  const admittedBytes = admitted.reduce((total, [, file]) => total + file.bytes.byteLength, 0);
   if (
-    operation === undefined ||
-    fetchedBytes > READ_AHEAD_MAX_OPERATION_BYTES - operation.readAheadFetchedBytes ||
-    fetchedEntries > READ_AHEAD_MAX_OPERATION_ENTRIES - operation.readAheadFetchedEntries
+    fetchedBytes < 0 ||
+    fetchedEntries < 0 ||
+    admittedBytes > operation.maxReadAheadBytes - operation.readAheadFetchedBytes ||
+    admitted.length > operation.maxReadAheadEntries - operation.readAheadFetchedEntries
   ) {
     return false;
   }
-  operation.readAheadFetchedBytes += fetchedBytes;
-  operation.readAheadFetchedEntries += fetchedEntries;
-  for (const [inode, file] of files) {
-    if (!operation.readAheadReadInodes.has(inode) && !operation.readAheadFiles.has(inode)) {
-      operation.readAheadFiles.set(inode, file);
-    }
+  operation.readAheadFetchedBytes += admittedBytes;
+  operation.readAheadFetchedEntries += admitted.length;
+  for (const [inode, file] of admitted) {
+    operation.readAheadFiles.set(inode, file);
   }
   return true;
 }
@@ -543,6 +625,8 @@ export function takeDatabaseOperationReadAheadFile(
   const file = operation?.readAheadFiles.get(inode);
   if (operation === undefined || file === undefined) return undefined;
   operation.readAheadFiles.delete(inode);
+  operation.readAheadFetchedBytes -= file.bytes.byteLength;
+  operation.readAheadFetchedEntries -= 1;
   return file;
 }
 
@@ -581,6 +665,10 @@ function clearOperationCaches(operation: OperationState): void {
   operation.metadataReservations.clear();
   operation.metadataPrefetchBytes = 0;
   operation.metadataReservationBytes = 0;
+  operation.metadataListedDirectories = 0;
+  operation.metadataPrefetchRoot = undefined;
+  operation.metadataSubtreePrefetched = false;
+  operation.metadataDirectoryProbes.clear();
   operation.readAheadFiles.clear();
   operation.readAheadProbes.clear();
   operation.readAheadAttemptedDirectories.clear();
@@ -588,6 +676,17 @@ function clearOperationCaches(operation: OperationState): void {
   operation.readAheadProbeEntries = 0;
   operation.readAheadFetchedBytes = 0;
   operation.readAheadFetchedEntries = 0;
+}
+
+function commonPathAncestor(left: string, right: string): string {
+  const leftParts = left.split("/");
+  const rightParts = right.split("/");
+  const shared: string[] = [];
+  const limit = Math.min(leftParts.length, rightParts.length);
+  for (let index = 0; index < limit && leftParts[index] === rightParts[index]; index += 1) {
+    shared.push(leftParts[index]);
+  }
+  return shared.length <= 1 ? "/" : shared.join("/");
 }
 
 export function registerAfterOutermostCommit(db: Database, callback: TransactionCallback): void {

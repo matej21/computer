@@ -3,7 +3,7 @@ import { createWorkspaceError } from "../errors.js";
 import { canonicalizePath } from "../path.js";
 import { incrementRev } from "../rev.js";
 import { ROOT_INODE } from "../schema/index.js";
-import type { Database } from "../storage.js";
+import { acceptDatabaseOperationFileWrites, type Database } from "../storage.js";
 import { stageBlob } from "../sync/blobs.js";
 import { buildManifest } from "../sync/manifests.js";
 import { pathOf } from "../sync/paths.js";
@@ -1222,9 +1222,11 @@ export function writeFileSync(
   if (stageWriteBatchCreateSync(db, canonical, bytes, options, () => mtime)) return;
   flushWriteBatchBeforeMutation(db);
 
+  let contentPath: string | undefined;
   db.transactionSync(() => {
     const target = resolveWriteTarget(db, parts, canonical, options);
     if (target.kind === "existing") {
+      contentPath = target.canonicalPath;
       // Replace the existing representation. Orphaned blobs (if any)
       // are cleaned up by a later gc() pass.
       db.run("DELETE FROM vfs_chunks WHERE inode = ?", target.inode);
@@ -1253,6 +1255,9 @@ export function writeFileSync(
     insertFileDirent(db, target.parentInode, target.leafName, inode, target.canonicalPath);
     insertChunkRows(db, inode, chunks);
   });
+  if (contentPath !== undefined && !db.inTransaction) {
+    acceptDatabaseOperationFileWrites(db, [contentPath]);
+  }
 }
 
 export function writeFileRangesSync(
