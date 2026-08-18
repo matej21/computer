@@ -27,6 +27,7 @@ import {
   type WatchHandle,
   type WatchOptions,
 } from "./fs/watch.js";
+import { lookupWriteBatchPath } from "./fs/writeBatch.js";
 import { deleteWriteBuffer, getWriteBuffer } from "./fs/writeBuffer.js";
 import {
   createFileSync as createFileSyncImpl,
@@ -196,6 +197,11 @@ export class SQLiteWorkspaceProvider {
 
   statSync(path: string, _options?: { bigint?: boolean }): VirtualStatsLike {
     this.#assertOpen();
+    const staged = lookupWriteBatchPath(this.db, path);
+    if (staged?.kind === "entry") return wrapStagedStats(staged.value);
+    if (staged?.kind === "absent") {
+      throw createWorkspaceError("ENOENT", `no such path: ${path}`, path);
+    }
     return this.#statSync(this.db, path);
   }
 
@@ -212,7 +218,7 @@ export class SQLiteWorkspaceProvider {
       isFile: s.isFile,
       isDirectory: s.isDirectory,
       isSymbolicLink: false,
-      nlink: linkCount(db, s.inode),
+      nlink: () => linkCount(db, s.inode),
     });
   }
 
@@ -222,6 +228,11 @@ export class SQLiteWorkspaceProvider {
 
   lstatSync(path: string, _options?: { bigint?: boolean }): VirtualStatsLike {
     this.#assertOpen();
+    const staged = lookupWriteBatchPath(this.db, path);
+    if (staged?.kind === "entry") return wrapStagedStats(staged.value);
+    if (staged?.kind === "absent") {
+      throw createWorkspaceError("ENOENT", `no such path: ${path}`, path);
+    }
     const pending = findPendingWriteBuffer(this.db, path);
     if (pending !== undefined && pending.pending !== undefined) {
       return wrapStats({
@@ -232,7 +243,7 @@ export class SQLiteWorkspaceProvider {
         isFile: true,
         isDirectory: false,
         isSymbolicLink: false,
-        nlink: 1,
+        nlink: () => 1,
       });
     }
     const node = resolveInode(this.db, path, { followSymlinks: false });
@@ -240,10 +251,13 @@ export class SQLiteWorkspaceProvider {
       throw createWorkspaceError("ENOENT", `no such path: ${path}`, path);
     }
     const isSymlink = node.type === "symlink";
+    const buffered = node.type === "file" ? getWriteBuffer(this.db, node.inode) : undefined;
     const size = isSymlink
       ? (node.linkTarget ?? "").length
       : node.type === "file"
-        ? fileSize(this.db, node.inode)
+        ? buffered?.dirty
+          ? buffered.size
+          : node.size
         : 0;
     return wrapStats({
       mode: node.mode,
@@ -253,7 +267,7 @@ export class SQLiteWorkspaceProvider {
       isFile: node.type === "file",
       isDirectory: node.type === "dir",
       isSymbolicLink: isSymlink,
-      nlink: linkCount(this.db, node.inode),
+      nlink: () => linkCount(this.db, node.inode),
     });
   }
 
@@ -805,7 +819,25 @@ interface StatsInputs {
   isFile: boolean;
   isDirectory: boolean;
   isSymbolicLink: boolean;
-  nlink: number;
+  nlink: () => number;
+}
+
+function wrapStagedStats(input: {
+  mode: number;
+  mtime: number;
+  size: number;
+  type: "dir" | "file";
+}): VirtualStatsLike {
+  return wrapStats({
+    mode: input.mode,
+    size: input.size,
+    mtimeMs: input.mtime,
+    ino: 0,
+    isFile: input.type === "file",
+    isDirectory: input.type === "dir",
+    isSymbolicLink: false,
+    nlink: () => 1,
+  });
 }
 
 // POSIX mode-bit constants. Linux FUSE rejects a stat whose mode
@@ -827,20 +859,16 @@ function linkCount(db: Database, inode: number): number {
   return Math.max(1, count ?? 0);
 }
 
-function fileSize(db: Database, inode: number): number {
-  const buffered = getWriteBuffer(db, inode);
-  if (buffered?.dirty) {
-    return buffered.size;
-  }
-  return db.scalar<number>("SELECT size FROM vfs_nodes WHERE inode = ?", inode) ?? 0;
-}
-
 function wrapStats(input: StatsInputs): VirtualStatsLike {
   const mtime = new Date(input.mtimeMs);
+  let nlink: number | undefined;
   return {
     dev: 0,
     mode: (input.mode & 0o7777) | fileTypeBits(input),
-    nlink: input.nlink,
+    get nlink() {
+      if (nlink === undefined) nlink = input.nlink();
+      return nlink;
+    },
     uid: 0,
     gid: 0,
     rdev: 0,

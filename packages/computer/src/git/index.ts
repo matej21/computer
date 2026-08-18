@@ -11,10 +11,10 @@
 // Internally each method lazy-loads its heavy deps
 // (`isomorphic-git`, the http transport, and `diff` for patches)
 // and delegates to `cloneWith` / `diffWith`. The
-// loaders are memoised on the client so the dynamic imports fire
-// once across the lifetime of the client — without that, the CLI
-// would multiply the cost (re-importing isomorphic-git on every
-// dispatch) and even the existing JS surface re-imported per call.
+// loaders are memoized on the client so the dynamic imports fire
+// once across its lifetime. Each call gets a fresh filesystem
+// operation view while the expensive modules and Git object cache
+// remain shared.
 //
 // `cloneWith` and `diffWith` are still exported for callers that
 // bring their own FsClient — tests, custom adapters, running
@@ -22,6 +22,11 @@
 // only one most consumers need.
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/dofs";
+import {
+  type DatabaseOperationOptions,
+  withProviderOperation,
+} from "@cloudflare/dofs/internal/operation";
+import { withProviderWriteBatch } from "@cloudflare/dofs/internal/write-batch";
 
 import { type IsomorphicGitFSClient, workspaceIsomorphicGitClient } from "./adapter.js";
 import { type GitCliInput, type GitCliResult, runGitCli } from "./cli.js";
@@ -328,6 +333,20 @@ export interface WorkspaceGitClientOptions {
   defaultIdentity?: GitIdentity;
 }
 
+const GIT_TREE_READ_AHEAD_BYTES = 48 * 1024 * 1024;
+const GIT_TREE_READ_AHEAD_ENTRIES = 65_536;
+
+function gitOperationOptions(property: PropertyKey): DatabaseOperationOptions {
+  if (property === "status" || property === "diff" || property === "diffSummary") {
+    return {
+      metadataPrefetchThreshold: 1,
+      maxReadAheadBytes: GIT_TREE_READ_AHEAD_BYTES,
+      maxReadAheadEntries: GIT_TREE_READ_AHEAD_ENTRIES,
+    };
+  }
+  return { metadataPrefetchThreshold: 1 };
+}
+
 export interface CreateGitClientOptions {
   /**
    * Test seam for substituting the @platformatic/vfs adapter.
@@ -341,10 +360,9 @@ export type GitClientFactory = (options: WorkspaceGitClientOptions) => GitClient
 /**
  * Build a git client bound to a workspace.
  *
- * The FsClient is constructed lazily on first use and reused
- * across subsequent calls — `@platformatic/vfs.create()` is cheap
- * but not free, and the workspace provider is stable for the
- * lifetime of the client.
+ * Each method gets one filesystem operation view. Calls within that
+ * method share metadata prefetch and write batching, while separate
+ * Git calls cannot retain a closed provider.
  *
  * An isomorphic-git pack/index cache is also created per client
  * and threaded into every isogit call. Without this, each
@@ -365,10 +383,10 @@ export function createGitClient({
     ws,
     defaultIdentity,
   }: WorkspaceGitClientOptions): GitClient {
-    let fsPromise: Promise<IsomorphicGitFSClient> | undefined;
-    const fs = () => {
-      if (!fsPromise) fsPromise = adapter(ws.provider());
-      return fsPromise;
+    let providerRef: SQLiteWorkspaceProvider | undefined;
+    const provider = (): SQLiteWorkspaceProvider => {
+      providerRef ??= ws.provider();
+      return providerRef;
     };
     const cache: Record<string, unknown> = {};
 
@@ -392,314 +410,344 @@ export function createGitClient({
       return createPatchPromise;
     };
 
-    const client: GitClient = {
-      async clone(options) {
-        await cloneWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitClient>(),
-          http: await loadHttp(),
-          cache,
-        });
-      },
-      async diff(options = {}) {
-        const f = await fs();
-        return diffWith({
-          ...options,
-          fs: f,
-          git: await loadGit<IsomorphicGitDiffClient>(),
-          createPatch: await loadDiffPatch(),
-          readFile: readFileFrom(f),
-          cache,
-        });
-      },
-      async diffSummary(options = {}) {
-        const f = await fs();
-        return diffSummaryWith({
-          ...options,
-          fs: f,
-          git: await loadGit<IsomorphicGitDiffClient>(),
-          createPatch: await loadDiffPatch(),
-          readFile: readFileFrom(f),
-          cache,
-        });
-      },
-      async init(options = {}) {
-        await initWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitInitClient>(),
-        });
-      },
-      async status(options = {}) {
-        return statusWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitStatusClient>(),
-          cache,
-        });
-      },
-      async add(options) {
-        await addWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitAddClient>(),
-          cache,
-        });
-      },
-      async rm(options) {
-        await rmWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRmClient>(),
-          cache,
-        });
-      },
-      async commit(options) {
-        return commitWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitCommitClient>(),
-          cache,
-          defaultIdentity,
-        });
-      },
-      async log(options = {}) {
-        return logWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitReadsClient>(),
-          cache,
-        });
-      },
-      async show(options) {
-        return showWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitReadsClient>(),
-          cache,
-        });
-      },
-      async revParse(options) {
-        return revParseWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitReadsClient>(),
-          cache,
-        });
-      },
-      async repoRoot(options = {}) {
-        return repoRootWith({ ...options, fs: await fs() });
-      },
-      async currentBranch(options = {}) {
-        return currentBranchWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitReadsClient>(),
-        });
-      },
-      async lsFiles(options = {}) {
-        return lsFilesWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitReadsClient>(),
-          cache,
-        });
-      },
-      async lsTree(options) {
-        return lsTreeWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitReadsClient>(),
-          cache,
-        });
-      },
-      async branch(options) {
-        return branchWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRefsClient>(),
-        });
-      },
-      async branchDelete(options) {
-        return branchDeleteWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRefsClient>(),
-        });
-      },
-      async branchList(options = {}) {
-        return branchListWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRefsClient>(),
-        });
-      },
-      async tag(options) {
-        return tagWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRefsClient>(),
-        });
-      },
-      async tagDelete(options) {
-        return tagDeleteWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRefsClient>(),
-        });
-      },
-      async tagList(options = {}) {
-        return tagListWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRefsClient>(),
-        });
-      },
-      async checkout(options) {
-        return checkoutWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitRefsClient>(),
-          cache,
-        });
-      },
-      async fetch(options = {}) {
-        return fetchWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitNetworkClient>(),
-          http: await loadHttp(),
-          cache,
-        });
-      },
-      async push(options = {}) {
-        return pushWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitNetworkClient>(),
-          http: await loadHttp(),
-          cache,
-        });
-      },
-      async pull(options = {}) {
-        return pullWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitNetworkClient>(),
-          http: await loadHttp(),
-          cache,
-          defaultIdentity,
-        });
-      },
-      async merge(options) {
-        return mergeWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitNetworkClient>(),
-          cache,
-          defaultIdentity,
-        });
-      },
-      async remoteAdd(options) {
-        return remoteAddWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitNetworkClient>(),
-        });
-      },
-      async remoteRemove(options) {
-        return remoteRemoveWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitNetworkClient>(),
-        });
-      },
-      async remoteList(options = {}) {
-        return remoteListWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitNetworkClient>(),
-        });
-      },
-      async hashObject(options) {
-        return hashObjectWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitPlumbingClient>(),
-        });
-      },
-      async catFile(options) {
-        return catFileWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitPlumbingClient>(),
-          cache,
-        });
-      },
-      async updateRef(options) {
-        return updateRefWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitPlumbingClient>(),
-        });
-      },
-      async configGet(options) {
-        return configGetWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitPlumbingClient>(),
-        });
-      },
-      async configSet(options) {
-        return configSetWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitPlumbingClient>(),
-        });
-      },
-      async stashPush(options = {}) {
-        return stashPushWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitStashClient>(),
-        });
-      },
-      async stashList(options = {}) {
-        return stashListWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitStashClient>(),
-        });
-      },
-      async stashPop(options = {}) {
-        return stashPopWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitStashClient>(),
-        });
-      },
-      async reset(options = {}) {
-        return resetWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitResetClient>(),
-          cache,
-        });
-      },
-      async clean(options = {}) {
-        return cleanWith({
-          ...options,
-          fs: await fs(),
-          git: await loadGit<IsomorphicGitCleanClient>(),
-          cache,
-        });
-      },
-      async cli(input) {
-        return runGitCli(client, input, { defaultIdentity });
-      },
+    const createClient = (operationProvider: () => SQLiteWorkspaceProvider): GitClient => {
+      let fsPromise: Promise<IsomorphicGitFSClient> | undefined;
+      const fs = () => {
+        fsPromise ??= adapter(operationProvider());
+        return fsPromise;
+      };
+      const client: GitClient = {
+        async clone(options) {
+          await cloneWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitClient>(),
+            http: await loadHttp(),
+            cache,
+          });
+        },
+        async diff(options = {}) {
+          const f = await fs();
+          return diffWith({
+            ...options,
+            fs: f,
+            git: await loadGit<IsomorphicGitDiffClient>(),
+            createPatch: await loadDiffPatch(),
+            readFile: readFileFrom(f),
+            cache,
+          });
+        },
+        async diffSummary(options = {}) {
+          const f = await fs();
+          return diffSummaryWith({
+            ...options,
+            fs: f,
+            git: await loadGit<IsomorphicGitDiffClient>(),
+            createPatch: await loadDiffPatch(),
+            readFile: readFileFrom(f),
+            cache,
+          });
+        },
+        async init(options = {}) {
+          await initWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitInitClient>(),
+          });
+        },
+        async status(options = {}) {
+          return statusWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitStatusClient>(),
+            cache,
+          });
+        },
+        async add(options) {
+          await addWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitAddClient>(),
+            cache,
+          });
+        },
+        async rm(options) {
+          await rmWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRmClient>(),
+            cache,
+          });
+        },
+        async commit(options) {
+          return commitWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitCommitClient>(),
+            cache,
+            defaultIdentity,
+          });
+        },
+        async log(options = {}) {
+          return logWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitReadsClient>(),
+            cache,
+          });
+        },
+        async show(options) {
+          return showWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitReadsClient>(),
+            cache,
+          });
+        },
+        async revParse(options) {
+          return revParseWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitReadsClient>(),
+            cache,
+          });
+        },
+        async repoRoot(options = {}) {
+          return repoRootWith({ ...options, fs: await fs() });
+        },
+        async currentBranch(options = {}) {
+          return currentBranchWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitReadsClient>(),
+          });
+        },
+        async lsFiles(options = {}) {
+          return lsFilesWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitReadsClient>(),
+            cache,
+          });
+        },
+        async lsTree(options) {
+          return lsTreeWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitReadsClient>(),
+            cache,
+          });
+        },
+        async branch(options) {
+          return branchWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRefsClient>(),
+          });
+        },
+        async branchDelete(options) {
+          return branchDeleteWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRefsClient>(),
+          });
+        },
+        async branchList(options = {}) {
+          return branchListWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRefsClient>(),
+          });
+        },
+        async tag(options) {
+          return tagWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRefsClient>(),
+          });
+        },
+        async tagDelete(options) {
+          return tagDeleteWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRefsClient>(),
+          });
+        },
+        async tagList(options = {}) {
+          return tagListWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRefsClient>(),
+          });
+        },
+        async checkout(options) {
+          return checkoutWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitRefsClient>(),
+            cache,
+          });
+        },
+        async fetch(options = {}) {
+          return fetchWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitNetworkClient>(),
+            http: await loadHttp(),
+            cache,
+          });
+        },
+        async push(options = {}) {
+          return pushWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitNetworkClient>(),
+            http: await loadHttp(),
+            cache,
+          });
+        },
+        async pull(options = {}) {
+          return pullWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitNetworkClient>(),
+            http: await loadHttp(),
+            cache,
+            defaultIdentity,
+          });
+        },
+        async merge(options) {
+          return mergeWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitNetworkClient>(),
+            cache,
+            defaultIdentity,
+          });
+        },
+        async remoteAdd(options) {
+          return remoteAddWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitNetworkClient>(),
+          });
+        },
+        async remoteRemove(options) {
+          return remoteRemoveWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitNetworkClient>(),
+          });
+        },
+        async remoteList(options = {}) {
+          return remoteListWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitNetworkClient>(),
+          });
+        },
+        async hashObject(options) {
+          return hashObjectWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitPlumbingClient>(),
+          });
+        },
+        async catFile(options) {
+          return catFileWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitPlumbingClient>(),
+            cache,
+          });
+        },
+        async updateRef(options) {
+          return updateRefWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitPlumbingClient>(),
+          });
+        },
+        async configGet(options) {
+          return configGetWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitPlumbingClient>(),
+          });
+        },
+        async configSet(options) {
+          return configSetWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitPlumbingClient>(),
+          });
+        },
+        async stashPush(options = {}) {
+          return stashPushWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitStashClient>(),
+          });
+        },
+        async stashList(options = {}) {
+          return stashListWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitStashClient>(),
+          });
+        },
+        async stashPop(options = {}) {
+          return stashPopWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitStashClient>(),
+          });
+        },
+        async reset(options = {}) {
+          return resetWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitResetClient>(),
+            cache,
+          });
+        },
+        async clean(options = {}) {
+          return cleanWith({
+            ...options,
+            fs: await fs(),
+            git: await loadGit<IsomorphicGitCleanClient>(),
+            cache,
+          });
+        },
+        async cli(input) {
+          return runGitCli(client, input, { defaultIdentity });
+        },
+      };
+      return client;
     };
-    return client;
+
+    const target = createClient(provider);
+    return new Proxy(target, {
+      get(_target, property) {
+        const value = Reflect.get(target, property);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]): unknown =>
+          withProviderOperation(
+            provider(),
+            async (operationProvider) => {
+              return withProviderWriteBatch(operationProvider, async (batchProvider) => {
+                const operationClient = createClient(() => batchProvider);
+                const operation = Reflect.get(operationClient, property);
+                if (typeof operation !== "function") {
+                  throw new TypeError(`Git operation ${String(property)} is not callable`);
+                }
+                return operation.apply(operationClient, args);
+              });
+            },
+            gitOperationOptions(property),
+          );
+      },
+    });
   };
 }
 

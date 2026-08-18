@@ -132,6 +132,19 @@ describe("statusWith — derived XY codes", () => {
     await memfs.promises.mkdir("/no-repo", { recursive: true });
     expect(await statusWith({ git: isogit, fs: memfs, dir: "/no-repo" })).toEqual([]);
   });
+
+  it("does not rewrite the index stat cache while reporting status", async () => {
+    let refresh: boolean | undefined;
+    const client: IsomorphicGitStatusClient = {
+      statusMatrix: async (options) => {
+        refresh = options.refresh;
+        return [];
+      },
+    };
+
+    await expect(statusWith({ git: client, fs: memfs, dir: DIR })).resolves.toEqual([]);
+    expect(refresh).toBe(false);
+  });
 });
 
 describe("formatPorcelainV2", () => {

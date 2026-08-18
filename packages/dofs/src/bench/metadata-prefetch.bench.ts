@@ -17,6 +17,7 @@ const TIMING_GROUPS = 100;
 const noPrefetchOptions = {
   maxReadCacheEntries: 8192,
   maxMetadataPrefetchBytes: 0,
+  metadataPrefetchThreshold: Number.MAX_SAFE_INTEGER,
 } satisfies DatabaseOperationOptions & { maxMetadataPrefetchBytes: number };
 
 function buildWideDirectory(provider: SQLiteWorkspaceProvider): void {

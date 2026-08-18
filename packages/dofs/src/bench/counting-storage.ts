@@ -87,6 +87,7 @@ function topLevelOperation(query: string): string | undefined {
 }
 
 export class CountingStorage implements DurableObjectStorageLike {
+  readonly queries: string[] = [];
   statements = 0;
   reads = 0;
   writes = 0;
@@ -104,6 +105,7 @@ export class CountingStorage implements DurableObjectStorageLike {
         query: string,
         ...bindings: unknown[]
       ): SQLCursorLike<Row> => {
+        this.queries.push(query);
         this.statements += 1;
         this.classify(query);
         const cursor = inner.sql.exec<Row>(query, ...bindings);
@@ -148,6 +150,7 @@ export class CountingStorage implements DurableObjectStorageLike {
   }
 
   reset(): void {
+    this.queries.length = 0;
     this.statements = 0;
     this.reads = 0;
     this.writes = 0;

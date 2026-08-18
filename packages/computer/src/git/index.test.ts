@@ -6,15 +6,12 @@
 // diff.test.ts; what's worth pinning here is the binding contract.
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/dofs";
+import { SQLiteTestStorage } from "@cloudflare/dofs/testing";
 import { describe, expect, it, vi } from "vitest";
 
+import { Workspace } from "../workspace.js";
 import type { IsomorphicGitFSClient } from "./adapter.js";
 import { createGitClient } from "./index.js";
-
-// `createGitClient` only reads `.provider()` and forwards the
-// result to the adapter. A stub provider is enough; the adapter
-// itself is exercised by its own integration path.
-const opaqueProvider = {} as unknown as SQLiteWorkspaceProvider;
 
 function stubFs(): IsomorphicGitFSClient {
   return {
@@ -25,10 +22,29 @@ function stubFs(): IsomorphicGitFSClient {
 }
 
 describe("createGitClient", () => {
-  it("calls ws.provider() lazily on first use, then caches the FsClient", async () => {
-    const provider = vi.fn(() => opaqueProvider);
+  it("gives every Git call one operation-bound provider", async () => {
+    const storage = new SQLiteTestStorage();
+    const ws = new Workspace({ storage });
+    const rootProvider = ws.provider();
+    const provider = vi.fn(() => rootProvider);
     const fs = stubFs();
-    const adapter = vi.fn(async () => fs);
+    const operationProviders: SQLiteWorkspaceProvider[] = [];
+    const stagedDirentCounts: number[] = [];
+    const adapter = vi.fn(async (operationProvider: SQLiteWorkspaceProvider) => {
+      operationProviders.push(operationProvider);
+      const index = operationProviders.length;
+      const path = `/operation-${index}.txt`;
+      await operationProvider.writeFile(path, `content ${index}`);
+      await Promise.resolve();
+      expect((await operationProvider.lstat(path)).size).toBe(9);
+      stagedDirentCounts.push(
+        rootProvider.db.scalar<number>(
+          "SELECT COUNT(*) FROM vfs_dirents WHERE parent_inode = 1 AND name = ?",
+          `operation-${index}.txt`,
+        ) ?? 0,
+      );
+      return fs;
+    });
 
     const client = createGitClient({ adapter })({ ws: { provider } });
 
@@ -36,18 +52,27 @@ describe("createGitClient", () => {
     expect(provider).not.toHaveBeenCalled();
     expect(adapter).not.toHaveBeenCalled();
 
-    // First op fails (the fake fs/git layer below isomorphic-git
-    // can't service a real clone) — but provider/adapter are
-    // observed before the failure.
-    await client.clone({ url: "https://example.test/repo.git" }).catch(() => {});
-    expect(provider).toHaveBeenCalledTimes(1);
-    expect(adapter).toHaveBeenCalledTimes(1);
-    expect(adapter).toHaveBeenCalledWith(opaqueProvider);
+    try {
+      await client.clone({ url: "https://example.test/repo.git" }).catch(() => {});
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(adapter).toHaveBeenCalledTimes(1);
+      expect(stagedDirentCounts).toEqual([0]);
+      expect(operationProviders[0]).not.toBe(rootProvider);
+      expect(() => operationProviders[0]?.existsSync("/")).toThrowError(
+        "Database operation is closed",
+      );
 
-    // A second op reuses the cached FsClient — neither provider
-    // nor adapter is invoked again.
-    await client.diff().catch(() => {});
-    expect(provider).toHaveBeenCalledTimes(1);
-    expect(adapter).toHaveBeenCalledTimes(1);
+      await client.diff().catch(() => {});
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(adapter).toHaveBeenCalledTimes(2);
+      expect(stagedDirentCounts).toEqual([0, 0]);
+      expect(operationProviders[1]).not.toBe(operationProviders[0]);
+      expect(() => operationProviders[1]?.existsSync("/")).toThrowError(
+        "Database operation is closed",
+      );
+    } finally {
+      await ws.close();
+      storage.close();
+    }
   });
 });
